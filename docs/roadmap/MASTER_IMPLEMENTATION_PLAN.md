@@ -96,26 +96,20 @@ File counts are workflow heuristics, not provider limits. If an agent expects to
 
 ## 4. Existing agents and reuse strategy
 
-Study these during Phase 00. Do not clone and run all of them or copy code just to “learn from it.” Read architecture docs and actual licenses; run only targeted proof-of-fit experiments.
+Phase 00 review is complete and Option B is accepted. These projects remain references or potential integration candidates. Before a later, authorized proof-of-fit, recheck the current architecture docs and actual licenses; do not clone every project or copy code just to “learn from it.”
 
 | Project | Why it matters | Recommended use |
 |---|---|---|
-| [OpenClaw](https://github.com/openclaw/openclaw) | Close to a complete personal assistant: local Gateway/control plane, model adapters, channels, tools, device nodes | First comparison target. Check whether its supported channels/nodes can be reused behind an adapter; read https://github.com/openclaw/openclaw/blob/main/SECURITY.md before enabling host tools. Do not blindly fork or grant broad permissions. |
+| [OpenClaw](https://github.com/openclaw/openclaw) | Close to a complete personal assistant: local Gateway/control plane, model adapters, channels, tools, device nodes | Potential external local Gateway behind a JARVIS-owned adapter. Check whether its channels/nodes fit JARVIS's permission boundary; read https://github.com/openclaw/openclaw/blob/main/SECURITY.md before enabling host tools. It is not the authoritative JARVIS control plane; do not blindly fork or grant broad permissions. |
 | [Open Interpreter](https://github.com/openinterpreter/openinterpreter) | Computer-operation and tool execution patterns | Reference for computer-operation UX; avoid unrestricted execution. |
 | [OpenHands SDK](https://github.com/OpenHands/software-agent-sdk) | Coding agents, workspace isolation, events and tool patterns | Potential specialized coding worker later; not required for Alpha. |
 | [Letta](https://docs.letta.com/concepts/stateful-agents) | Stateful agents and memory | Compare memory ideas but keep JARVIS memory contracts independent. |
 | [LangGraph durable execution](https://langchain-ai.github.io/langgraph/concepts/durable_execution/) | Checkpoints and recovery in multi-step workflows | Evaluate against a small custom task state machine; use only if it reduces work without taking over JARVIS semantics. |
 | [Google Antigravity VS Code extension](https://www.antigravity.google/docs/ide/extensions/) | Agentic development with implementation plans, inline diffs and workspace rules | Secondary read-only reviewer and bounded fallback, separate from JARVIS runtime. |
 
-### Architecture decision gate
+### Accepted architecture decision
 
-Default recommendation: **JARVIS-owned control plane with selectively reused components**. Phase 00 must compare:
-
-- **A — Extend OpenClaw:** potentially fastest route to channels/devices, but greater coupling to its runtime and extension boundaries.
-- **B — JARVIS modular core + optional OpenClaw/MCP adapters:** strongest control over task state, permissions and memory while reusing integrations where practical. Default choice.
-- **C — Build every integration from scratch:** highest bespoke control, slowest and least efficient; avoid unless A/B fail requirements.
-
-Score each option on durable goals/tasks, ownership of control plane, Windows/Android fit, messaging breadth, security, model independence, memory provenance, maintenance, resource use and zero mandatory cost. Record the decision and rejection reasons. Check licenses before embedding source or redistributing binaries; referencing a project is not permission to copy its code.
+Phase 00 is complete and Option B is approved: JARVIS owns the control plane, with selective adapters for suitable components. OpenClaw may be evaluated as an external local Gateway behind a JARVIS-owned adapter; it does not own authoritative JARVIS task state, policy, memory contracts or verification. The A/B/C scorecard, evidence, trade-offs and reversal criteria are recorded in [ADR 0001](../decisions/0001-architecture-choice.md). Before any later reuse, recheck fit, license, security and maintenance; this decision does not approve embedding or forking external source.
 
 ---
 
@@ -243,7 +237,8 @@ A phase is complete only when its gate passes, not merely when code has been gen
 
 ### Phase 00 — Feasibility and architecture decision
 **Branch:** `phase/00-feasibility`  
-Compare extending OpenClaw with a JARVIS-owned core plus adapters; inspect projects/licenses/security; verify tools, Windows automation, local inference feasibility, free coding-agent quotas, Android APIs and call restrictions.  
+Compared extending OpenClaw, a JARVIS-owned core with adapters, and building integrations from scratch; reviewed projects/licenses/security and researched tools, Windows automation, local inference feasibility, coding-agent entitlements, Android APIs and call restrictions. Findings and the accepted decision are in the ADR and feasibility report.
+
 **Deliverables:** `docs/decisions/0001-architecture-choice.md`, `docs/research/FEASIBILITY_REPORT.md`, risk register and prioritized tasks.  
 **Do not:** install every candidate, download model weights, connect personal accounts, or add paid services.  
 **Gate:** evidence-based decision, recorded assumptions and explicit deferred capabilities.
