@@ -249,7 +249,8 @@ Build typed FastAPI app, config, redacted structured logging, error handling, he
 **Gate:** setup works on Python 3.12; local server binds to loopback; tests and Ruff pass; no secrets tracked.
 
 ### Phase 02 — Model gateway
-**Branch:** `feat/model-gateway`  
+**Branch:** `phase/02-model-gateway`
+
 Build provider protocol, deterministic mock adapter, typed request/response/errors, structured-output validation, capability declarations, router-policy skeleton, timeout/cancellation, usage/quota event metadata. Add a real provider only after data/privacy/quota policy is approved.  
 **Gate:** provider can be swapped without changing task state; malformed/unavailable provider is handled; no paid fallback.
 
