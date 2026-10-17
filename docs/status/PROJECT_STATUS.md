@@ -1,9 +1,9 @@
 # JARVIS Project Status
 
-**Last updated:** Phase 02A provider-neutral gateway core — 17 October 2026
-**Current stage:** Phase 02A implemented locally; final acceptance and commit pending
-**Current branch:** `phase/02-model-gateway`
-**Status:** Phase 01 — Reliable Application Foundation was accepted, merged into `main`, and pushed at merge commit `331fade`. Final local verification passed with Ruff, 14 tests under Python 3.12.4, and `git diff --check`; the project owner confirmed the GitHub Actions workflow succeeded. Phase 02A provider-neutral gateway core is implemented locally. Antigravity independently verified the Python 3.12.4 check: Ruff passed, all 30 tests passed in 1.55 seconds, and Git whitespace checks passed; one existing Starlette/httpx deprecation warning remains. Phase 02A is pending final acceptance and commit.
+**Last updated:** Phase 02B local Ollama adapter review — 17 October 2026
+**Current stage:** Phase 02B implemented locally and independently reviewed; final acceptance and commit pending
+**Current branch:** `phase/02b-ollama-adapter`
+**Status:** Phase 01 — Reliable Application Foundation was accepted, merged into `main`, and pushed at merge commit `331fade`. Final local verification passed with Ruff, 14 tests under Python 3.12.4, and `git diff --check`; the project owner confirmed the GitHub Actions workflow succeeded. Phase 02A provider-neutral gateway core is implemented locally. Phase 02B adds a local Ollama adapter. Antigravity independently reviewed Phase 02B and returned PASS WITH FINDINGS, with no critical or high-severity issues and no mandatory source-code corrections before acceptance. Its recorded Python 3.12.4 check passed Ruff, all 56 tests, and Git whitespace checks; one existing Starlette/httpx deprecation warning remains. Final Phase 02B acceptance and commit are pending.
 
 ## Phase 00 completed work (2026-10-17)
 - Prepared `docs/decisions/0001-architecture-choice.md` with a weighted A/B/C scorecard (weights total 100%), evidence, trade-offs, and reversal criteria. Recommendation: JARVIS-owned Python control plane with selective adapters; evaluate OpenClaw as an external local Gateway before considering a fork.
@@ -29,14 +29,15 @@
 - Setup, check and run scripts are provided; setup remains unverified on Python 3.12 in this environment.
 
 ## Not implemented yet
-- Real model providers or routing.
+- Live Ollama integration: Ollama and `qwen3.5:2b` have not been installed/downloaded, and live local inference through JARVIS has not been verified.
+- Production model routing is not yet wired into FastAPI routes.
 - Goal planning and durable task state.
 - Tool registry or execution tools.
 - Persistent memory.
 - Windows automation, Android, communication integrations, voice or vision.
 
 ## Next task
-Complete final Phase 02A acceptance and commit review.
+Complete final Phase 02B acceptance and commit. Push and GitHub Actions verification, Ollama/model installation, and live local inference verification remain pending.
 
 ## Earlier checks before Phase 01 acceptance
 - `scripts/check.ps1` under Python 3.13: passed; Ruff passed and 12 tests passed, with 1 third-party deprecation warning.
@@ -66,3 +67,9 @@ The preceding check sections preserve earlier agent-session observations. The fi
 - Ruff and `git diff --check` passed; the full suite reported 30 passed under the existing Python 3.13.1 `.venv`, with one existing Starlette/httpx deprecation warning. These tests use no network sockets, credentials, services, or model weights.
 - This execution context previously could not launch `.venv-py312` because its recorded base Python executable path was unavailable. Antigravity subsequently independently verified `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\check.ps1 -VenvPath ".venv-py312"` with exit code 0 using Python 3.12.4: Ruff passed, all 30 tests passed in 1.55 seconds, and Git whitespace checks passed. One existing Starlette/httpx deprecation warning remains. This is an independently reported result; it was not rerun in this documentation-only task.
 - No dependency, CI, script, configuration, route, local-provider, remote-provider, or model-runtime changes were made. Phase 02A remains pending final acceptance and commit.
+
+## Phase 02B — Local Ollama adapter (2026-10-17)
+- Implemented a local-only asynchronous adapter for Ollama's native `/api/chat` endpoint, with a loopback-literal URL restriction, `trust_env=False`, a configured `qwen3.5:2b` model identifier, explicit context length, typed error normalization, and offline mock-transport tests. The adapter is not implicitly registered with the gateway router.
+- Antigravity independently reviewed the adapter and reported **PASS WITH FINDINGS**, with no critical or high-severity issues. The reviewer found no mandatory source-code corrections before acceptance.
+- The reviewer recorded `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\check.ps1 -VenvPath ".venv-py312"` passing under Python 3.12.4: Ruff passed; all 56 tests passed (14 foundation, 16 gateway-core, 26 local-adapter); Git whitespace checks passed. One existing Starlette/httpx deprecation warning remains. These are the independent reviewer's results, not a rerun in this documentation update.
+- Pending: final Phase 02B acceptance and commit; push and GitHub Actions verification for the Phase 02B branch; Ollama installation and download of the selected model; live local inference verification through the JARVIS gateway. No claim is made that Ollama or `qwen3.5:2b` is installed or has been tested live.
