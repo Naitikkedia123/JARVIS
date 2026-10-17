@@ -38,5 +38,5 @@ A Python modular monolith on Windows, SQLite when persistence is added, FastAPI 
 - Untrusted web pages/files/messages cannot override system policy.
 - Cellular call control/audio is a tested feasibility question, not an assumed Android capability.
 
-## Architecture decision is gated
-Phase 00 compares extending OpenClaw with a JARVIS-owned modular core plus selective OpenClaw/MCP integrations. Do not embed or fork external source before checking fit, license, security and maintenance.
+## Accepted architecture direction
+Phase 00 is accepted. Option B is the approved direction: JARVIS owns its control plane, including task state, permissions, model-routing policy, memory contracts and verification. OpenClaw remains a potential external integration behind a selective adapter; it is not the authoritative JARVIS control plane. Recheck fit, license, security and maintenance before reusing or embedding any external component. See [ADR 0001](../decisions/0001-architecture-choice.md) for the decision and trade-offs.
