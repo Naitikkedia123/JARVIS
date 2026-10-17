@@ -93,15 +93,19 @@ class LocalOllamaProvider:
         base_url: str = DEFAULT_OLLAMA_URL,
         model_id: str = DEFAULT_MODEL_ID,
         context_length: int = DEFAULT_CONTEXT_LENGTH,
+        think: bool = False,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         if not isinstance(model_id, str) or not model_id or len(model_id) > _MAX_MODEL_ID_LENGTH:
             raise ValueError("Ollama model identifier must contain 1 to 128 characters.")
         if isinstance(context_length, bool) or not isinstance(context_length, int) or context_length < 1:
             raise ValueError("Ollama context length must be a positive integer.")
+        if not isinstance(think, bool):
+            raise ValueError("Ollama thinking option must be a boolean.")
         self._base_url = _validate_base_url(base_url)
         self._model_id = model_id
         self._context_length = context_length
+        self._think = think
         self._transport = transport
 
     async def generate(self, request: ModelRequest) -> ProviderOutput:
@@ -111,6 +115,7 @@ class LocalOllamaProvider:
         payload: dict[str, Any] = {
             "model": self._model_id,
             "messages": [message.model_dump() for message in request.messages],
+            "think": self._think,
             "stream": False,
             "options": {
                 "temperature": request.temperature,

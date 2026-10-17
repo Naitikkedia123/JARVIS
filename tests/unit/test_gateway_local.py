@@ -39,11 +39,13 @@ def run_request(
     model_request: ModelRequest | None = None,
     base_url: str = "http://127.0.0.1:11434",
     model_id: str = "qwen3.5:2b",
+    think: bool = False,
 ) -> object:
     async def scenario() -> object:
         provider = LocalOllamaProvider(
             base_url=base_url,
             model_id=model_id,
+            think=think,
             transport=transport,
         )
         return await provider.generate(model_request or request())
@@ -83,9 +85,59 @@ def test_maps_request_to_local_ollama_chat_and_parses_response() -> None:
     assert payload == {
         "model": "qwen3.5:2b",
         "messages": [{"role": "user", "content": "hello"}],
+        "think": False,
         "stream": False,
         "options": {"temperature": 0.0, "num_predict": 512, "num_ctx": 4096},
     }
+
+
+def test_constructor_defaults_thinking_to_false() -> None:
+    payloads: list[dict[str, object]] = []
+
+    def handler(request_: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request_.content))
+        return httpx.Response(
+            200,
+            json={
+                "model": "qwen3.5:2b",
+                "message": {"role": "assistant", "content": "ok"},
+                "done": True,
+            },
+        )
+
+    async def scenario() -> None:
+        provider = LocalOllamaProvider(transport=httpx.MockTransport(handler))
+        await provider.generate(request())
+
+    asyncio.run(scenario())
+    assert payloads[0]["think"] is False
+
+
+def test_forwards_explicitly_enabled_thinking_option() -> None:
+    payloads: list[dict[str, object]] = []
+
+    def handler(request_: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request_.content))
+        return httpx.Response(
+            200,
+            json={
+                "model": "qwen3.5:2b",
+                "message": {"role": "assistant", "content": "ok"},
+                "done": True,
+            },
+        )
+
+    run_request(httpx.MockTransport(handler), think=True)
+    assert payloads[0]["think"] is True
+
+
+@pytest.mark.parametrize("think", ["false", 1, 0, None, []])
+def test_rejects_invalid_thinking_options(think: object) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"Ollama thinking option must be a boolean\.",
+    ):
+        LocalOllamaProvider(think=think)
 
 
 def test_missing_or_invalid_metadata_remains_optional() -> None:
