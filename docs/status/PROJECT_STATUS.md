@@ -1,9 +1,9 @@
 # JARVIS Project Status
 
-**Last updated:** Phase 01 accepted; Phase 02 design review complete — 17 October 2026
-**Current stage:** Phase 02 — Model Gateway design review complete; implementation not started
+**Last updated:** Phase 02A provider-neutral gateway core — 17 October 2026
+**Current stage:** Phase 02A implemented locally; final acceptance and commit pending
 **Current branch:** `phase/02-model-gateway`
-**Status:** Phase 01 — Reliable Application Foundation was accepted, merged into `main`, and pushed at merge commit `331fade`. Final local verification passed with Ruff, 14 tests under Python 3.12.4, and `git diff --check`; the project owner confirmed the GitHub Actions workflow succeeded. Phase 02 design review is complete, but no Phase 02 implementation or tests have started.
+**Status:** Phase 01 — Reliable Application Foundation was accepted, merged into `main`, and pushed at merge commit `331fade`. Final local verification passed with Ruff, 14 tests under Python 3.12.4, and `git diff --check`; the project owner confirmed the GitHub Actions workflow succeeded. Phase 02A provider-neutral gateway core is implemented locally. Antigravity independently verified the Python 3.12.4 check: Ruff passed, all 30 tests passed in 1.55 seconds, and Git whitespace checks passed; one existing Starlette/httpx deprecation warning remains. Phase 02A is pending final acceptance and commit.
 
 ## Phase 00 completed work (2026-10-17)
 - Prepared `docs/decisions/0001-architecture-choice.md` with a weighted A/B/C scorecard (weights total 100%), evidence, trade-offs, and reversal criteria. Recommendation: JARVIS-owned Python control plane with selective adapters; evaluate OpenClaw as an external local Gateway before considering a fork.
@@ -36,7 +36,7 @@
 - Windows automation, Android, communication integrations, voice or vision.
 
 ## Next task
-Begin Phase 02 — Model Gateway implementation on `phase/02-model-gateway` after the completed design review.
+Complete final Phase 02A acceptance and commit review.
 
 ## Earlier checks before Phase 01 acceptance
 - `scripts/check.ps1` under Python 3.13: passed; Ruff passed and 12 tests passed, with 1 third-party deprecation warning.
@@ -59,3 +59,10 @@ Begin Phase 02 — Model Gateway implementation on `phase/02-model-gateway` afte
 - Requested command `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\check.ps1 -VenvPath ".venv-py312"` exited 1 before Ruff or pytest because that interpreter could not launch. No environment was installed, upgraded, deleted, or recreated. Remote CI remains unverified.
 
 The preceding check sections preserve earlier agent-session observations. The final Phase 01 acceptance verification recorded above supersedes their pending-acceptance and unverified-CI status: the owner confirmed the Python 3.12.4 local results and successful GitHub Actions run.
+
+## Phase 02A — Provider-neutral model gateway core (2026-10-17)
+- Added Pydantic request/response, message, capability, usage and provider-output contracts; a minimal asynchronous provider and routing-policy protocol; typed safe gateway errors; an explicit no-fallback router; and a deterministic mock provider. The gateway is internal and is not wired to FastAPI routes.
+- Structured output is checked against a requested Pydantic model only when the selected provider declares support. Provider errors and timeout outcomes are normalized without raw messages; caller cancellation propagates. Usage and provider-reported quota fields remain optional and non-negative; the gateway does not enforce quotas.
+- Ruff and `git diff --check` passed; the full suite reported 30 passed under the existing Python 3.13.1 `.venv`, with one existing Starlette/httpx deprecation warning. These tests use no network sockets, credentials, services, or model weights.
+- This execution context previously could not launch `.venv-py312` because its recorded base Python executable path was unavailable. Antigravity subsequently independently verified `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\check.ps1 -VenvPath ".venv-py312"` with exit code 0 using Python 3.12.4: Ruff passed, all 30 tests passed in 1.55 seconds, and Git whitespace checks passed. One existing Starlette/httpx deprecation warning remains. This is an independently reported result; it was not rerun in this documentation-only task.
+- No dependency, CI, script, configuration, route, local-provider, remote-provider, or model-runtime changes were made. Phase 02A remains pending final acceptance and commit.
