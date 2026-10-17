@@ -1,9 +1,9 @@
 # JARVIS Project Status
 
-**Last updated:** Phase 01 foundation implementation — 17 October 2026
-**Current stage:** Phase 01 — Foundation implementation; acceptance pending Python 3.12 setup verification and CI execution
-**Current branch:** `phase/01-foundation`
-**Status:** The foundation slice is implemented. Local Ruff/tests and loopback endpoint checks passed under Python 3.13. The existing `.venv` uses Python 3.13.1. Python 3.12 availability is unresolved: one agent session's launcher reported only Python 3.13, while another reported Python 3.12.4 at `C:\Users\user\AppData\Local\Programs\Python\Python312\python.exe`. This discrepancy remains unresolved until checked in the user's actual PowerShell session. A clean Python 3.12 setup is unverified, and CI has not been run remotely.
+**Last updated:** Phase 02A provider-neutral gateway core — 17 October 2026
+**Current stage:** Phase 02A implemented locally; final acceptance and commit pending
+**Current branch:** `phase/02-model-gateway`
+**Status:** Phase 01 — Reliable Application Foundation was accepted, merged into `main`, and pushed at merge commit `331fade`. Final local verification passed with Ruff, 14 tests under Python 3.12.4, and `git diff --check`; the project owner confirmed the GitHub Actions workflow succeeded. Phase 02A provider-neutral gateway core is implemented locally. Antigravity independently verified the Python 3.12.4 check: Ruff passed, all 30 tests passed in 1.55 seconds, and Git whitespace checks passed; one existing Starlette/httpx deprecation warning remains. Phase 02A is pending final acceptance and commit.
 
 ## Phase 00 completed work (2026-10-17)
 - Prepared `docs/decisions/0001-architecture-choice.md` with a weighted A/B/C scorecard (weights total 100%), evidence, trade-offs, and reversal criteria. Recommendation: JARVIS-owned Python control plane with selective adapters; evaluate OpenClaw as an external local Gateway before considering a fork.
@@ -36,9 +36,9 @@
 - Windows automation, Android, communication integrations, voice or vision.
 
 ## Next task
-Verify clean setup under Python 3.12 and obtain a CI run before marking Phase 01 accepted.
+Complete final Phase 02A acceptance and commit review.
 
-## Current checks
+## Earlier checks before Phase 01 acceptance
 - `scripts/check.ps1` under Python 3.13: passed; Ruff passed and 12 tests passed, with 1 third-party deprecation warning.
 - `scripts/run-local.ps1`: passed; health/readiness payloads verified and listener confirmed on `127.0.0.1:8000` only.
 - `scripts/setup-dev.ps1`: Python 3.12 setup is unverified. The launcher discrepancy requires confirmation in the user's PowerShell session; remote CI has not been run.
@@ -57,3 +57,12 @@ Verify clean setup under Python 3.12 and obtain a CI run before marking Phase 01
 - The new test passed under the existing Python 3.13.1 `.venv`; the full suite reported 14 passed with the existing Starlette/httpx deprecation warning. Ruff passed during this verification.
 - The owner reports earlier Python 3.12.4 checks and a local server run using `.venv-py312`. This execution context could not independently repeat them: `.venv-py312\pyvenv.cfg` records Python 3.12.4 and a base path under `C:\Users\user\AppData\Local\Programs\Python\Python312`, but invoking its `python.exe` reports that the recorded base interpreter path is unavailable here.
 - Requested command `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\check.ps1 -VenvPath ".venv-py312"` exited 1 before Ruff or pytest because that interpreter could not launch. No environment was installed, upgraded, deleted, or recreated. Remote CI remains unverified.
+
+The preceding check sections preserve earlier agent-session observations. The final Phase 01 acceptance verification recorded above supersedes their pending-acceptance and unverified-CI status: the owner confirmed the Python 3.12.4 local results and successful GitHub Actions run.
+
+## Phase 02A — Provider-neutral model gateway core (2026-10-17)
+- Added Pydantic request/response, message, capability, usage and provider-output contracts; a minimal asynchronous provider and routing-policy protocol; typed safe gateway errors; an explicit no-fallback router; and a deterministic mock provider. The gateway is internal and is not wired to FastAPI routes.
+- Structured output is checked against a requested Pydantic model only when the selected provider declares support. Provider errors and timeout outcomes are normalized without raw messages; caller cancellation propagates. Usage and provider-reported quota fields remain optional and non-negative; the gateway does not enforce quotas.
+- Ruff and `git diff --check` passed; the full suite reported 30 passed under the existing Python 3.13.1 `.venv`, with one existing Starlette/httpx deprecation warning. These tests use no network sockets, credentials, services, or model weights.
+- This execution context previously could not launch `.venv-py312` because its recorded base Python executable path was unavailable. Antigravity subsequently independently verified `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\check.ps1 -VenvPath ".venv-py312"` with exit code 0 using Python 3.12.4: Ruff passed, all 30 tests passed in 1.55 seconds, and Git whitespace checks passed. One existing Starlette/httpx deprecation warning remains. This is an independently reported result; it was not rerun in this documentation-only task.
+- No dependency, CI, script, configuration, route, local-provider, remote-provider, or model-runtime changes were made. Phase 02A remains pending final acceptance and commit.
