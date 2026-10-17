@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets and local data
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+data/local/**
+data/artifacts/**
+logs/**
+*.sqlite
+*.sqlite3
+*.db
+
+# Editors / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local model weights/caches
+models/
+*.gguf
+*.safetensors
+*.onnx
+*.tflite
