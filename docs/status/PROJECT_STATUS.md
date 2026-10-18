@@ -1,9 +1,9 @@
 # JARVIS Project Status
 
-**Last updated:** Phase 03 acceptance — 18 October 2026
-**Current stage:** Phase 03 — Goals, Plans and Durable Tasks accepted; owner review and commit/push pending
-**Current branch:** `feat/durable-task-runtime`
-**Status:** Phase 01 is accepted and merged into `main`; Phases 02A and 02B are implemented and accepted, with local Ollama gateway validation documented. Phase 03 passed its implementation reviews and validation: 38 focused tests and 101 full-suite tests passed under Python 3.12.4, and Ruff and `git diff --check` passed. Phase 03 has not yet been committed or pushed.
+**Last updated:** Phase 04 implementation and validation — 18 October 2026
+**Current stage:** Phase 04 — Tool registry, policy, workspace tools and approval-request interface implemented and validated; not merged
+**Current branch:** `feat/tool-registry-security`
+**Status:** Phase 01 is accepted and merged into `main`; Phases 02A and 02B are implemented and accepted, with local Ollama gateway validation documented. Phase 03 is accepted based on its implementation reviews and Python 3.12.4 validation. Phase 04 implementation and validation are complete on the current feature branch. The Phase 04 changes have not been staged, committed, pushed or merged.
 
 ## Phase 00 completed work (2026-10-17)
 - Prepared `docs/decisions/0001-architecture-choice.md` with a weighted A/B/C scorecard (weights total 100%), evidence, trade-offs, and reversal criteria. Recommendation: JARVIS-owned Python control plane with selective adapters; evaluate OpenClaw as an external local Gateway before considering a fork.
@@ -20,7 +20,7 @@
 - Regression coverage includes health/readiness, loopback setting rejection, secret redaction, disabled Uvicorn access logs, and generic HTTP, validation and internal-error responses.
 - `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\check.ps1` — passed under Python 3.13: Ruff passed; pytest reported 12 passed, 1 third-party Starlette/httpx deprecation warning; `git diff --check` passed (Git emitted LF-to-CRLF conversion warnings).
 - `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-local.ps1` — started successfully. `/health` and `/ready` returned the payloads above. `netstat -ano -p tcp` showed the listener only at `127.0.0.1:8000`; the test server was stopped afterward.
-- `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dev.ps1` — historical attempt did not complete: that agent session's `py -0p` showed Python 3.13 only and `py -3.12` could not select a runtime. This does not establish that Python 3.12 is absent machine-wide. A Python 3.13 `.venv` was created and existing declared dependencies were installed to run the checks; no dependency declarations changed. The clean Python 3.12 setup remains unverified.
+- `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-dev.ps1` — historical attempt did not complete: that agent session's `py -0p` showed Python 3.13 only and `py -3.12` could not select a runtime. This does not establish that Python 3.12 is absent machine-wide. A Python 3.13 `.venv` was created and existing declared dependencies were installed to run the checks; no dependency declarations changed. This records the setup state at that time; later Python 3.12.4 verification is recorded under Phases 02B, 03 and 04.
 - CI workflow inspection confirms Python 3.12 setup, Ruff and pytest steps with no secrets. A remote CI run has not been performed.
 
 ## Initial scaffold verification (Phase 01 baseline)
@@ -30,12 +30,11 @@
 
 ## Later phases not implemented
 - Production model routing is not wired into FastAPI routes; the validated gateway remains an internal provider/routing component.
-- Phase 04 tool registry and authorization policy.
 - Persistent memory.
 - Windows automation, Android, communication integrations, voice, and vision.
 
 ## Next task
-Phase 03 is accepted. Review and commit/push are pending owner action. Begin a later phase only after separate approval.
+Phase 04 implementation and validation are complete. Owner review and any staging, commit, push or merge remain pending. Begin a later phase only after separate approval.
 
 ## Earlier checks before Phase 01 acceptance
 - `scripts/check.ps1` under Python 3.13: passed; Ruff passed and 12 tests passed, with 1 third-party deprecation warning.
@@ -78,4 +77,15 @@ The preceding check sections preserve earlier agent-session observations. The fi
 - File-backed recovery tests simulate an effect occurring before success is durably recorded and confirm that an uncertain non-idempotent step is not automatically replayed. Completed steps are not silently re-executed during recovery.
 - Antigravity's runtime review verdict was **PASS WITH FINDINGS**, with no blocking findings. Its follow-up review of M-1 returned **PASS**. M-1 was resolved by normalizing malformed persisted JSON and `StepResult` validation failures to a generic `TaskStoreError`; tests cover both corrupt forms and preserve not-found behavior.
 - Owner-provided Python 3.12.4 acceptance results: focused Phase 03 tests, 38 passed; full suite, 101 passed with one existing Starlette/httpx deprecation warning. Ruff and `git diff --check` passed.
-- No claim is made that SQLite guarantees exactly-once external effects, that scheduling works across multiple processes, or that JARVIS is production-ready. No real external tools were added. The current branch's Phase 03 work has not been committed or pushed.
+- No claim is made that SQLite guarantees exactly-once external effects, that scheduling works across multiple processes, or that JARVIS is production-ready. No real external tools were added. Phase 03 was subsequently merged into `main` through PR #1, squash-merge commit `8cd3af1`. Phase 04 is the current uncommitted implementation on `feat/tool-registry-security`.
+
+## Phase 04 — Typed Tool Registry and Permission Policy (implementation and validation complete)
+
+- Implemented typed tool contracts and a registry populated only by trusted application code. Dispatcher construction seals registration. A separate default-deny policy uses trusted authorization context; model-generated requests cannot provide identity or capabilities. Dispatch validates inputs and outputs and enforces bounded timeouts and result sizes.
+- Added structured audit events for authorization and dispatch outcomes. Audit metadata excludes raw arguments, outputs, credentials and exception messages. The provided in-memory audit sink is non-durable; its records are lost when the process exits.
+- Pass B1 added a local-only status tool and workspace list/read/create operations using an injected, validated workspace root. Requests cannot override the root. Paths are restricted, reads and writes are byte-limited, creation is exclusive, and writes require both `workspace:write` and `tool:write`.
+- Workspace-root initialization checks the original path for symlinks and Windows reparse points and compares filesystem identity across validation steps. Operations recheck the retained root identity. Path-based operations do not eliminate races from a hostile concurrent local filesystem replacement; the configured workspace must be trusted against concurrent local mutation.
+- Pass B2 added typed, in-memory pending approval requests for tools that require approval. The dispatcher validates and authorizes before creating a request from trusted tool metadata and principal context, then raises a typed approval-required outcome without invoking the executor. There is no approval UI, trusted decision channel, durable storage, expiry workflow, or execution-after-approval path. If audit recording fails after request creation, a pending in-memory request may remain, but the executor is not invoked.
+- Independent review results: Pass A final review **PASS WITH FINDINGS**, with core authorization and auditing controls confirmed; Pass B1 final review **PASS WITH FINDINGS**, with no blocker or high-severity issue and its narrow filesystem TOCTOU limitation documented; Pass B2 review **PASS WITH FINDINGS**, with no blocker or high-severity issue and the audit-failure behavior documented.
+- Owner-run Python 3.12.4 validation: focused approval, tool, status, workspace and integration-security tests reported **51 passed, 2 skipped**; the full suite reported **152 passed, 2 skipped**, with one existing Starlette/httpx deprecation warning. The two skipped tests require symlink creation, which Windows policy denied in that environment; those scenarios were not dynamically tested. Ruff passed. `git diff --check` passed with a Git LF-to-CRLF conversion warning for the threat model.
+- Phase 04 is not merged into `main`, and its changes have not been staged, committed or pushed. These results do not establish race-free filesystem operations, durable auditing or approval storage, production readiness, or an approval decision/execution workflow.
