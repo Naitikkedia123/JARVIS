@@ -1,0 +1,292 @@
+"""Single-process task execution with bounded attempts and conservative recovery."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from threading import Lock
+from typing import Protocol
+from uuid import UUID
+
+from jarvis.tasks.errors import InvalidTransitionError, TaskError
+from jarvis.tasks.models import (
+    AttemptOutcome,
+    GoalState,
+    ReconciliationOutcome,
+    SafeErrorCode,
+    Step,
+    StepResult,
+    StepState,
+    Task,
+    TaskPlan,
+    TaskState,
+)
+from jarvis.tasks.planner import Planner
+from jarvis.tasks.store import TaskStore
+
+
+class StepRunner(Protocol):
+    """Typed in-process executor; truthy capability promises stable-key deduplication."""
+
+    deduplicates_idempotency_keys: bool
+
+    def execute(self, step: Step, *, idempotency_key: str | None) -> StepResult: ...
+
+
+class StepExecutionFailure(Exception):
+    """A known non-applied execution failure safe to classify and bound."""
+
+    def __init__(self, *, retryable: bool) -> None:
+        self.retryable = retryable
+        super().__init__("Step execution failed.")
+
+
+class UncertainStepOutcomeError(TaskError):
+    """Execution did not provide enough evidence to record a known outcome."""
+
+
+class RuntimeBusyError(TaskError):
+    """Another task is currently being dispatched in this process."""
+
+
+_PROCESS_RUN_LOCK = Lock()
+_CONTROL_LOCK = Lock()
+_ACTIVE_TASK: tuple[str, str] | None = None
+_PAUSE_REQUESTS: set[tuple[str, str]] = set()
+_CANCEL_REQUESTS: set[tuple[str, str]] = set()
+
+
+class TaskRuntime:
+    """Coordinates a planner, durable store, and explicitly injected runner."""
+
+    def __init__(self, store: TaskStore, planner: Planner, runner: StepRunner) -> None:
+        self.store = store
+        self.planner = planner
+        self.runner = runner
+        self._database_key = str(Path(store.db_path).resolve())
+
+    def create_task(self, goal_id: str) -> TaskPlan:
+        goal = self.store.get_goal(goal_id)
+        if goal.state is not GoalState.ACTIVE:
+            raise InvalidTransitionError("Only active goals can be planned.")
+        plan = self.planner.plan(goal)
+        if plan.task.planner_version != self.planner.version:
+            plan.task.planner_version = self.planner.version
+        return self.store.add_task_plan(plan.task, plan.steps)
+
+    def pause_task(self, task_id: str) -> Task:
+        request_key = (self._database_key, task_id)
+        with _CONTROL_LOCK:
+            if _ACTIVE_TASK == request_key:
+                _PAUSE_REQUESTS.add(request_key)
+                return self.store.get_task(task_id)
+        task = self.store.get_task(task_id)
+        if task.state in (TaskState.READY, TaskState.RUNNING):
+            return self.store.transition_task(task_id, TaskState.PAUSED)
+        if task.state is TaskState.PAUSED:
+            return task
+        raise InvalidTransitionError("Only ready or running tasks can be paused.")
+
+    def resume_task(self, task_id: str) -> Task:
+        task = self.store.get_task(task_id)
+        if task.state is TaskState.PAUSED:
+            self.store.transition_task(task_id, TaskState.READY)
+        return self.run_task(task_id)
+
+    def cancel_task(self, task_id: str) -> Task:
+        request_key = (self._database_key, task_id)
+        with _CONTROL_LOCK:
+            if _ACTIVE_TASK == request_key:
+                _CANCEL_REQUESTS.add(request_key)
+                return self.store.get_task(task_id)
+        task = self.store.get_task(task_id)
+        if task.state in (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED):
+            return task
+        if task.state is TaskState.RUNNING:
+            self._recover_running_steps(task_id)
+            task = self.store.get_task(task_id)
+        if task.state is TaskState.RECONCILIATION_REQUIRED:
+            return task
+        if task.state is TaskState.CANCELLING:
+            return self._finish_cancellation(task_id)
+        if task.state is not TaskState.CANCELLING:
+            if task.state is TaskState.READY:
+                task = self.store.transition_task(task_id, TaskState.CANCELLED)
+                self._cancel_unstarted_steps(task_id)
+                return task
+            task = self.store.transition_task(task_id, TaskState.CANCELLING)
+        self._cancel_unstarted_steps(task_id)
+        return self.store.transition_task(task_id, TaskState.CANCELLED)
+
+    def run_task(self, task_id: str) -> Task:
+        global _ACTIVE_TASK
+        if not _PROCESS_RUN_LOCK.acquire(blocking=False):
+            raise RuntimeBusyError("A task is already being dispatched in this process.")
+        request_key = (self._database_key, task_id)
+        with _CONTROL_LOCK:
+            _ACTIVE_TASK = request_key
+        try:
+            return self._run_task_locked(task_id)
+        finally:
+            with _CONTROL_LOCK:
+                _ACTIVE_TASK = None
+                _PAUSE_REQUESTS.discard(request_key)
+                _CANCEL_REQUESTS.discard(request_key)
+            _PROCESS_RUN_LOCK.release()
+
+    def reconcile_step(
+        self,
+        step_id: str,
+        outcome: ReconciliationOutcome,
+        *,
+        confirmation_id: UUID,
+        result: StepResult | None = None,
+    ) -> Task:
+        step = self.store.get_step(step_id)
+        task = self.store.get_task(step.task_id)
+        if task.state is TaskState.RUNNING:
+            self._recover_running_steps(task.id)
+            if any(
+                item.state is StepState.RECONCILIATION_REQUIRED
+                for item in self.store.list_steps(task.id)
+            ):
+                task = self.store.transition_task(
+                    task.id, TaskState.RECONCILIATION_REQUIRED
+                )
+        if task.state is not TaskState.RECONCILIATION_REQUIRED:
+            raise InvalidTransitionError("Task is not awaiting reconciliation.")
+        self.store.reconcile_step(
+            step_id, outcome, confirmation_id=confirmation_id, result=result
+        )
+        steps = self.store.list_steps(task.id)
+        if any(item.state is StepState.RECONCILIATION_REQUIRED for item in steps):
+            return self.store.get_task(task.id)
+        if any(item.state is StepState.FAILED for item in steps):
+            return self.store.transition_task(task.id, TaskState.FAILED)
+        if all(item.state is StepState.SUCCEEDED for item in steps):
+            return self.store.transition_task(task.id, TaskState.COMPLETED)
+        return self.store.transition_task(task.id, TaskState.READY)
+
+    def _run_task_locked(self, task_id: str) -> Task:
+        task = self.store.get_task(task_id)
+        if task.state in (
+            TaskState.PAUSED,
+            TaskState.CANCELLED,
+            TaskState.COMPLETED,
+            TaskState.FAILED,
+            TaskState.RECONCILIATION_REQUIRED,
+        ):
+            return task
+        if task.state is TaskState.CANCELLING:
+            return self._finish_cancellation(task_id)
+        if task.state is TaskState.READY:
+            task = self.store.transition_task(task_id, TaskState.RUNNING)
+
+        self._recover_running_steps(task_id)
+        while True:
+            task = self.store.get_task(task_id)
+            if task.state is TaskState.RUNNING:
+                steps = self.store.list_steps(task_id)
+                if any(step.state is StepState.RECONCILIATION_REQUIRED for step in steps):
+                    return self.store.transition_task(task_id, TaskState.RECONCILIATION_REQUIRED)
+                if any(step.state is StepState.FAILED for step in steps):
+                    return self.store.transition_task(task_id, TaskState.FAILED)
+                if all(step.state is StepState.SUCCEEDED for step in steps):
+                    return self.store.transition_task(task_id, TaskState.COMPLETED)
+
+                candidate = next(
+                    (
+                        step
+                        for step in steps
+                        if step.state in (StepState.PENDING, StepState.READY, StepState.RETRY_WAIT)
+                        and all(
+                            self.store.get_step(dependency).state is StepState.SUCCEEDED
+                            for dependency in step.dependencies
+                        )
+                    ),
+                    None,
+                )
+                if candidate is None:
+                    return self.store.transition_task(task_id, TaskState.FAILED)
+                if candidate.state in (StepState.PENDING, StepState.RETRY_WAIT):
+                    candidate = self.store.transition_step(candidate.id, StepState.READY)
+                self._dispatch(candidate)
+                pause, cancel = self._requested_control(task_id)
+                current = self.store.get_step(candidate.id)
+                if current.state is StepState.RECONCILIATION_REQUIRED:
+                    return self.store.transition_task(task_id, TaskState.RECONCILIATION_REQUIRED)
+                if cancel:
+                    self.store.transition_task(task_id, TaskState.CANCELLING)
+                    self._cancel_unstarted_steps(task_id)
+                    return self.store.transition_task(task_id, TaskState.CANCELLED)
+                if pause:
+                    return self.store.transition_task(task_id, TaskState.PAUSED)
+        return self.store.get_task(task_id)
+
+    def _dispatch(self, step: Step) -> None:
+        attempt = self.store.start_step_attempt(step.id)
+        if step.replay_safety.value == "idempotent" and not getattr(
+            self.runner, "deduplicates_idempotency_keys", False
+        ):
+            self.store.finish_step_attempt(
+                attempt.step_id,
+                AttemptOutcome.PERMANENT_FAILURE,
+                error_code=SafeErrorCode.PERMANENT,
+            )
+            return
+        try:
+            result = self.runner.execute(step, idempotency_key=step.idempotency_key)
+            if not isinstance(result, StepResult):
+                raise TypeError("Step runners must return StepResult.")
+        except StepExecutionFailure as exc:
+            outcome = (
+                AttemptOutcome.RETRYABLE_FAILURE
+                if exc.retryable
+                else AttemptOutcome.PERMANENT_FAILURE
+            )
+            error_code = SafeErrorCode.TRANSIENT if exc.retryable else SafeErrorCode.PERMANENT
+            self.store.finish_step_attempt(step.id, outcome, error_code=error_code)
+        except Exception:
+            safe_replay = step.replay_safety.value == "pure" or (
+                step.replay_safety.value == "idempotent"
+                and getattr(self.runner, "deduplicates_idempotency_keys", False) is True
+            )
+            self.store.finish_step_attempt(
+                step.id,
+                AttemptOutcome.OUTCOME_UNKNOWN,
+                allow_safe_replay=safe_replay,
+            )
+        else:
+            self.store.finish_step_attempt(step.id, AttemptOutcome.SUCCEEDED, result=result)
+
+    def _recover_running_steps(self, task_id: str) -> None:
+        allow_idempotent = getattr(self.runner, "deduplicates_idempotency_keys", False) is True
+        for step in self.store.list_steps(task_id):
+            if step.state is StepState.RUNNING:
+                self.store.recover_interrupted_attempt(
+                    step.id, allow_idempotent_replay=allow_idempotent
+                )
+
+    def _requested_control(self, task_id: str) -> tuple[bool, bool]:
+        request_key = (self._database_key, task_id)
+        with _CONTROL_LOCK:
+            return request_key in _PAUSE_REQUESTS, request_key in _CANCEL_REQUESTS
+
+    def _cancel_unstarted_steps(self, task_id: str) -> None:
+        for step in self.store.list_steps(task_id):
+            if step.state in (
+                StepState.PENDING,
+                StepState.READY,
+                StepState.RETRY_WAIT,
+                StepState.PAUSED,
+            ):
+                self.store.transition_step(step.id, StepState.CANCELLED)
+
+    def _finish_cancellation(self, task_id: str) -> Task:
+        self._recover_running_steps(task_id)
+        steps = self.store.list_steps(task_id)
+        if any(step.state is StepState.RECONCILIATION_REQUIRED for step in steps):
+            return self.store.transition_task(
+                task_id, TaskState.RECONCILIATION_REQUIRED
+            )
+        self._cancel_unstarted_steps(task_id)
+        return self.store.transition_task(task_id, TaskState.CANCELLED)
