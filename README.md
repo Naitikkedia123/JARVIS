@@ -3,7 +3,9 @@
 JARVIS is a model-independent personal AI operating-system project. This repository is built in tested stages with coding agents. The detailed plan is in `docs/roadmap/MASTER_IMPLEMENTATION_PLAN.md`.
 
 ## Status
-Initial scaffold only; this is not a complete autonomous assistant.
+Phase 05 Memory v1 is merged into `main`. Phase 06 Pass B is in progress on
+`feat/research-browser-tools`; the read-only research tool integration is not
+yet accepted or merged. JARVIS is not a complete autonomous assistant.
 
 ## Quick start (Windows PowerShell)
 ```powershell
