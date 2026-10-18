@@ -1,9 +1,9 @@
 # JARVIS Project Status
 
-**Last updated:** Phase 04 implementation and validation — 18 October 2026
-**Current stage:** Phase 04 — Tool registry, policy, workspace tools and approval-request interface implemented and validated; not merged
-**Current branch:** `feat/tool-registry-security`
-**Status:** Phase 01 is accepted and merged into `main`; Phases 02A and 02B are implemented and accepted, with local Ollama gateway validation documented. Phase 03 is accepted based on its implementation reviews and Python 3.12.4 validation. Phase 04 implementation and validation are complete on the current feature branch. The Phase 04 changes have not been staged, committed, pushed or merged.
+**Last updated:** Phase 05 owner acceptance — 18 October 2026
+**Current stage:** Phase 05 — Memory v1 implemented, independently reviewed, validated and accepted by the owner
+**Current branch:** `feat/memory-v1`
+**Status:** Phases 00–03 retain their accepted historical status. Phase 04 was accepted and merged into `main` through PR #2, squash commit `a492fbe`. Phase 05 is accepted on the current feature branch and has not been staged, committed, pushed or merged.
 
 ## Phase 00 completed work (2026-10-17)
 - Prepared `docs/decisions/0001-architecture-choice.md` with a weighted A/B/C scorecard (weights total 100%), evidence, trade-offs, and reversal criteria. Recommendation: JARVIS-owned Python control plane with selective adapters; evaluate OpenClaw as an external local Gateway before considering a fork.
@@ -30,11 +30,11 @@
 
 ## Later phases not implemented
 - Production model routing is not wired into FastAPI routes; the validated gateway remains an internal provider/routing component.
-- Persistent memory.
+- Local provenance-aware SQLite memory is implemented in Phase 05; embeddings and production integration remain future work.
 - Windows automation, Android, communication integrations, voice, and vision.
 
 ## Next task
-Phase 04 implementation and validation are complete. Owner review and any staging, commit, push or merge remain pending. Begin a later phase only after separate approval.
+Phase 05 is accepted. The next phase remains pending separate owner direction.
 
 ## Earlier checks before Phase 01 acceptance
 - `scripts/check.ps1` under Python 3.13: passed; Ruff passed and 12 tests passed, with 1 third-party deprecation warning.
@@ -77,7 +77,7 @@ The preceding check sections preserve earlier agent-session observations. The fi
 - File-backed recovery tests simulate an effect occurring before success is durably recorded and confirm that an uncertain non-idempotent step is not automatically replayed. Completed steps are not silently re-executed during recovery.
 - Antigravity's runtime review verdict was **PASS WITH FINDINGS**, with no blocking findings. Its follow-up review of M-1 returned **PASS**. M-1 was resolved by normalizing malformed persisted JSON and `StepResult` validation failures to a generic `TaskStoreError`; tests cover both corrupt forms and preserve not-found behavior.
 - Owner-provided Python 3.12.4 acceptance results: focused Phase 03 tests, 38 passed; full suite, 101 passed with one existing Starlette/httpx deprecation warning. Ruff and `git diff --check` passed.
-- No claim is made that SQLite guarantees exactly-once external effects, that scheduling works across multiple processes, or that JARVIS is production-ready. No real external tools were added. Phase 03 was subsequently merged into `main` through PR #1, squash-merge commit `8cd3af1`. Phase 04 is the current uncommitted implementation on `feat/tool-registry-security`.
+- No claim is made that SQLite guarantees exactly-once external effects, that scheduling works across multiple processes, or that JARVIS is production-ready. No real external tools were added. Phase 03 was subsequently merged into `main` through PR #1, squash-merge commit `8cd3af1`; Phase 04 was later merged through PR #2, squash commit `a492fbe`.
 
 ## Phase 04 — Typed Tool Registry and Permission Policy (implementation and validation complete)
 
@@ -88,4 +88,14 @@ The preceding check sections preserve earlier agent-session observations. The fi
 - Pass B2 added typed, in-memory pending approval requests for tools that require approval. The dispatcher validates and authorizes before creating a request from trusted tool metadata and principal context, then raises a typed approval-required outcome without invoking the executor. There is no approval UI, trusted decision channel, durable storage, expiry workflow, or execution-after-approval path. If audit recording fails after request creation, a pending in-memory request may remain, but the executor is not invoked.
 - Independent review results: Pass A final review **PASS WITH FINDINGS**, with core authorization and auditing controls confirmed; Pass B1 final review **PASS WITH FINDINGS**, with no blocker or high-severity issue and its narrow filesystem TOCTOU limitation documented; Pass B2 review **PASS WITH FINDINGS**, with no blocker or high-severity issue and the audit-failure behavior documented.
 - Owner-run Python 3.12.4 validation: focused approval, tool, status, workspace and integration-security tests reported **51 passed, 2 skipped**; the full suite reported **152 passed, 2 skipped**, with one existing Starlette/httpx deprecation warning. The two skipped tests require symlink creation, which Windows policy denied in that environment; those scenarios were not dynamically tested. Ruff passed. `git diff --check` passed with a Git LF-to-CRLF conversion warning for the threat model.
-- Phase 04 is not merged into `main`, and its changes have not been staged, committed or pushed. These results do not establish race-free filesystem operations, durable auditing or approval storage, production readiness, or an approval decision/execution workflow.
+- Phase 04 was merged into `main` through PR #2, squash commit `a492fbe`. Its implementation results do not establish race-free filesystem operations, durable auditing or approval storage, production readiness, or an approval decision/execution workflow.
+
+## Phase 05 — Memory v1 (implemented, reviewed, validated and accepted)
+- Added typed, strictly validated task episode, explicit preference, project fact and artifact-reference records with UTC timestamps, provenance, confidence, scope, sensitivity, permission, validity, expiry, version and supersession metadata.
+- Added an injected-path SQLite store with the separate `memory_schema_migrations` ledger, foreign-key enforcement, bounded busy timeout, ordered transactional migrations, transactional corrections/deletion, optimistic version checks, and a bounded retrieval layer that enforces scope, sensitivity, permission, provenance, lifecycle and validity constraints in SQL.
+- Legacy rows migrate without loss of content and receive `legacy_unknown` provenance, `legacy_inaccessible` scope, restricted sensitivity and unspecified permission. They remain inaccessible through normal retrieval until separately governed.
+- Full-text retrieval uses SQLite FTS5 when available and a parameterized, escaped `LIKE` fallback otherwise. Metadata filters and full-text results share the same access-control and current-validity filters. Correction preserves the previous version as superseded; deleting a replacement does not reactivate its predecessor. Deletion removes the selected database row and its search entry.
+- Added deterministic local tests for validation, provenance, authorization, ID non-disclosure, validity windows, full-text/metadata retrieval, correction/deletion, rollback, migrations, and close/reopen persistence.
+- Owner-provided Python 3.12.4 validation: 28 focused memory tests passed; the full suite reported 180 passed and 2 skipped; Ruff and `git diff --check` passed. The two skipped tests require symlink creation, which Windows policy prevented, so those scenarios were not dynamically tested. Python 3.13.1 validation was also reported as passing: 28 focused memory tests, 180 passed and 2 skipped in the full suite, Ruff and `git diff --check`; the full run reported one existing Starlette/httpx deprecation warning. A separate implementation-agent environment could not independently reproduce the Python 3.12.4 run; the owner subsequently verified Python 3.12.4 successfully in the repository's VS Code terminal.
+- Access contexts remain trusted caller inputs, not authentication. SQLite deletion removes the row and search entry but does not guarantee forensic erasure from database pages, WAL files, backups or storage media. No embeddings, external services, model calls, background jobs, memory API routes or task-gateway wiring were added; production readiness is not claimed.
+- Phase 05 was accepted by the owner on `feat/memory-v1`. Its changes have not been staged, committed, pushed or merged. The next phase remains pending separate direction.
