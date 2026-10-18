@@ -7,6 +7,9 @@ from threading import Lock
 from typing import Protocol
 from uuid import UUID
 
+from jarvis.memory.context import MemoryContextAssembler, TaskMemoryContext
+from jarvis.memory.errors import MemoryError
+from jarvis.memory.models import RetrievalContext
 from jarvis.tasks.errors import InvalidTransitionError, TaskError
 from jarvis.tasks.models import (
     AttemptOutcome,
@@ -32,6 +35,18 @@ class StepRunner(Protocol):
     def execute(self, step: Step, *, idempotency_key: str | None) -> StepResult: ...
 
 
+class ContextAwareStepRunner(Protocol):
+    """Optional runner interface for explicit delivery of untrusted memory data."""
+
+    def execute_with_memory_context(
+        self,
+        step: Step,
+        *,
+        idempotency_key: str | None,
+        memory_context: TaskMemoryContext,
+    ) -> StepResult: ...
+
+
 class StepExecutionFailure(Exception):
     """A known non-applied execution failure safe to classify and bound."""
 
@@ -48,6 +63,10 @@ class RuntimeBusyError(TaskError):
     """Another task is currently being dispatched in this process."""
 
 
+class MemoryContextUnavailableError(TaskError):
+    """Task execution cannot safely retrieve or deliver its requested memory context."""
+
+
 _PROCESS_RUN_LOCK = Lock()
 _CONTROL_LOCK = Lock()
 _ACTIVE_TASK: tuple[str, str] | None = None
@@ -56,12 +75,20 @@ _CANCEL_REQUESTS: set[tuple[str, str]] = set()
 
 
 class TaskRuntime:
-    """Coordinates a planner, durable store, and explicitly injected runner."""
+    """Coordinates planning, durable state, optional memory context, and a runner."""
 
-    def __init__(self, store: TaskStore, planner: Planner, runner: StepRunner) -> None:
+    def __init__(
+        self,
+        store: TaskStore,
+        planner: Planner,
+        runner: StepRunner,
+        *,
+        memory_context_assembler: MemoryContextAssembler | None = None,
+    ) -> None:
         self.store = store
         self.planner = planner
         self.runner = runner
+        self.memory_context_assembler = memory_context_assembler
         self._database_key = str(Path(store.db_path).resolve())
 
     def create_task(self, goal_id: str) -> TaskPlan:
@@ -86,11 +113,14 @@ class TaskRuntime:
             return task
         raise InvalidTransitionError("Only ready or running tasks can be paused.")
 
-    def resume_task(self, task_id: str) -> Task:
+    def resume_task(
+        self, task_id: str, *, memory_access: RetrievalContext | None = None
+    ) -> Task:
+        self._require_context_runner()
         task = self.store.get_task(task_id)
         if task.state is TaskState.PAUSED:
             self.store.transition_task(task_id, TaskState.READY)
-        return self.run_task(task_id)
+        return self.run_task(task_id, memory_access=memory_access)
 
     def cancel_task(self, task_id: str) -> Task:
         request_key = (self._database_key, task_id)
@@ -117,21 +147,35 @@ class TaskRuntime:
         self._cancel_unstarted_steps(task_id)
         return self.store.transition_task(task_id, TaskState.CANCELLED)
 
-    def run_task(self, task_id: str) -> Task:
+    def run_task(
+        self, task_id: str, *, memory_access: RetrievalContext | None = None
+    ) -> Task:
         global _ACTIVE_TASK
+        if self.memory_context_assembler is None and memory_access is not None:
+            raise MemoryContextUnavailableError("Task memory context is not configured.")
+        self._require_context_runner()
         if not _PROCESS_RUN_LOCK.acquire(blocking=False):
             raise RuntimeBusyError("A task is already being dispatched in this process.")
         request_key = (self._database_key, task_id)
         with _CONTROL_LOCK:
             _ACTIVE_TASK = request_key
         try:
-            return self._run_task_locked(task_id)
+            memory_context = self._assemble_task_context(task_id, memory_access)
+            return self._run_task_locked(task_id, memory_context)
         finally:
             with _CONTROL_LOCK:
                 _ACTIVE_TASK = None
                 _PAUSE_REQUESTS.discard(request_key)
                 _CANCEL_REQUESTS.discard(request_key)
             _PROCESS_RUN_LOCK.release()
+
+    def _require_context_runner(self) -> None:
+        if self.memory_context_assembler is not None and not callable(
+            getattr(self.runner, "execute_with_memory_context", None)
+        ):
+            raise MemoryContextUnavailableError(
+                "The configured step runner cannot receive task memory context."
+            )
 
     def reconcile_step(
         self,
@@ -166,7 +210,26 @@ class TaskRuntime:
             return self.store.transition_task(task.id, TaskState.COMPLETED)
         return self.store.transition_task(task.id, TaskState.READY)
 
-    def _run_task_locked(self, task_id: str) -> Task:
+    def _assemble_task_context(
+        self, task_id: str, memory_access: RetrievalContext | None
+    ) -> TaskMemoryContext | None:
+        assembler = self.memory_context_assembler
+        if assembler is None:
+            return None
+        task = self.store.get_task(task_id)
+        if task.state not in (TaskState.READY, TaskState.RUNNING):
+            return None
+        try:
+            goal = self.store.get_goal(task.goal_id)
+            return assembler.assemble(task, goal, memory_access or RetrievalContext())
+        except MemoryError as exc:
+            raise MemoryContextUnavailableError(
+                "Task memory context could not be retrieved."
+            ) from exc
+
+    def _run_task_locked(
+        self, task_id: str, memory_context: TaskMemoryContext | None = None
+    ) -> Task:
         task = self.store.get_task(task_id)
         if task.state in (
             TaskState.PAUSED,
@@ -209,7 +272,7 @@ class TaskRuntime:
                     return self.store.transition_task(task_id, TaskState.FAILED)
                 if candidate.state in (StepState.PENDING, StepState.RETRY_WAIT):
                     candidate = self.store.transition_step(candidate.id, StepState.READY)
-                self._dispatch(candidate)
+                self._dispatch(candidate, memory_context)
                 pause, cancel = self._requested_control(task_id)
                 current = self.store.get_step(candidate.id)
                 if current.state is StepState.RECONCILIATION_REQUIRED:
@@ -222,7 +285,9 @@ class TaskRuntime:
                     return self.store.transition_task(task_id, TaskState.PAUSED)
         return self.store.get_task(task_id)
 
-    def _dispatch(self, step: Step) -> None:
+    def _dispatch(
+        self, step: Step, memory_context: TaskMemoryContext | None = None
+    ) -> None:
         attempt = self.store.start_step_attempt(step.id)
         if step.replay_safety.value == "idempotent" and not getattr(
             self.runner, "deduplicates_idempotency_keys", False
@@ -234,7 +299,21 @@ class TaskRuntime:
             )
             return
         try:
-            result = self.runner.execute(step, idempotency_key=step.idempotency_key)
+            if memory_context is None:
+                result = self.runner.execute(step, idempotency_key=step.idempotency_key)
+            else:
+                execute_with_context = getattr(
+                    self.runner, "execute_with_memory_context", None
+                )
+                if not callable(execute_with_context):
+                    raise MemoryContextUnavailableError(
+                        "The configured step runner cannot receive task memory context."
+                    )
+                result = execute_with_context(
+                    step,
+                    idempotency_key=step.idempotency_key,
+                    memory_context=memory_context,
+                )
             if not isinstance(result, StepResult):
                 raise TypeError("Step runners must return StepResult.")
         except StepExecutionFailure as exc:

@@ -1,5 +1,14 @@
 """Local provenance-aware memory with explicit access and management contexts."""
 
+from jarvis.memory.context import (
+    MAX_ASSEMBLED_CONTEXT_CHARS,
+    MAX_CONTEXT_CANDIDATES,
+    MAX_CONTEXT_RECORDS,
+    MAX_MEMORY_RECORD_CHARS,
+    MemoryContextAssembler,
+    RankedMemory,
+    TaskMemoryContext,
+)
 from jarvis.memory.errors import (
     MemoryAuthorizationError,
     MemoryConflictError,
@@ -21,9 +30,14 @@ from jarvis.memory.retrieval import SQLiteMemoryRetriever
 from jarvis.memory.storage import MemoryStore
 
 __all__ = [
+    "MAX_ASSEMBLED_CONTEXT_CHARS",
+    "MAX_CONTEXT_CANDIDATES",
+    "MAX_CONTEXT_RECORDS",
+    "MAX_MEMORY_RECORD_CHARS",
     "ManagementContext",
     "MemoryAuthorizationError",
     "MemoryConflictError",
+    "MemoryContextAssembler",
     "MemoryFilters",
     "MemoryRecord",
     "MemoryRecordNotFoundError",
@@ -34,6 +48,8 @@ __all__ = [
     "Provenance",
     "RecordState",
     "RetrievalContext",
+    "RankedMemory",
     "SQLiteMemoryRetriever",
     "Sensitivity",
+    "TaskMemoryContext",
 ]
