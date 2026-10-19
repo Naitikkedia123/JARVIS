@@ -14,7 +14,7 @@ from pydantic import ValidationError
 
 from jarvis.config import Settings
 from jarvis.logging import JsonRedactingFormatter, configure_logging
-from jarvis.main import app, request_validation_error_handler, unexpected_error_handler
+from jarvis.main import create_app, request_validation_error_handler, unexpected_error_handler
 
 
 def test_settings_default_to_loopback_and_local_development(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -247,8 +247,9 @@ def test_unexpected_errors_return_generic_client_response() -> None:
     assert secret not in response.text
 
 
-def test_http_errors_use_standardized_response() -> None:
-    with TestClient(app) as client:
+def test_http_errors_use_standardized_response(tmp_path) -> None:
+    test_app = create_app(Settings(device_database_path=tmp_path / "foundation.sqlite3"))
+    with TestClient(test_app) as client:
         response = client.get("/missing-resource")
 
     assert response.status_code == 404
