@@ -5,14 +5,28 @@ from __future__ import annotations
 from pathlib import Path
 from threading import Lock
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid5
 
+from jarvis.devices.models import Device
 from jarvis.memory.context import MemoryContextAssembler, TaskMemoryContext
 from jarvis.memory.errors import MemoryError
 from jarvis.memory.models import RetrievalContext
-from jarvis.tasks.errors import InvalidTransitionError, TaskError
+from jarvis.tasks.authorization import (
+    TaskAuthorizationContext,
+    TaskOwnership,
+    TaskSubmissionPolicy,
+    TaskSubmissionProposal,
+    TaskSubmissionReceipt,
+    resolve_task_authorization,
+)
+from jarvis.tasks.errors import (
+    InvalidTransitionError,
+    TaskAuthorizationError,
+    TaskError,
+)
 from jarvis.tasks.models import (
     AttemptOutcome,
+    Goal,
     GoalState,
     ReconciliationOutcome,
     SafeErrorCode,
@@ -47,6 +61,24 @@ class ContextAwareStepRunner(Protocol):
     ) -> StepResult: ...
 
 
+class AuthorizedStepRunner(Protocol):
+    """Runner boundary for device tasks.
+
+    Implementations must route tool requests through ``ToolDispatcher`` using
+    ``authorization.tool_authorization`` unchanged. They must not derive grants
+    from device roles, reported capabilities, or task content.
+    """
+
+    def execute_authorized(
+        self,
+        step: Step,
+        *,
+        idempotency_key: str | None,
+        authorization: TaskAuthorizationContext,
+        memory_context: TaskMemoryContext | None,
+    ) -> StepResult: ...
+
+
 class StepExecutionFailure(Exception):
     """A known non-applied execution failure safe to classify and bound."""
 
@@ -72,6 +104,7 @@ _CONTROL_LOCK = Lock()
 _ACTIVE_TASK: tuple[str, str] | None = None
 _PAUSE_REQUESTS: set[tuple[str, str]] = set()
 _CANCEL_REQUESTS: set[tuple[str, str]] = set()
+_DEVICE_GOAL_NAMESPACE = UUID("87526be7-1b0e-4b9a-8ea2-04e0f119f0af")
 
 
 class TaskRuntime:
@@ -100,7 +133,50 @@ class TaskRuntime:
             plan.task.planner_version = self.planner.version
         return self.store.add_task_plan(plan.task, plan.steps)
 
+    def submit_device_task(
+        self,
+        device: Device,
+        proposal: TaskSubmissionProposal,
+        *,
+        policy: TaskSubmissionPolicy | None,
+    ) -> TaskSubmissionReceipt:
+        """Authorize and durably create an owned task without executing it."""
+        resolve_task_authorization(device, proposal, policy)
+        ownership = TaskOwnership(
+            device_id=device.id,
+            idempotency_key=proposal.idempotency_key,
+            request_digest=proposal.request_digest(),
+        )
+        existing = self.store.find_device_task_submission(ownership)
+        if existing is not None:
+            return TaskSubmissionReceipt(
+                plan=existing,
+                created=False,
+            )
+        goal_id = uuid5(
+            _DEVICE_GOAL_NAMESPACE,
+            f"{device.id}:{proposal.idempotency_key}",
+        ).hex
+        goal = Goal(
+            id=goal_id,
+            title=proposal.title,
+            description=proposal.description,
+        )
+        plan = self.planner.plan(goal)
+        if plan.task.planner_version != self.planner.version:
+            plan.task.planner_version = self.planner.version
+        persisted_plan, created = self.store.add_device_task_submission(
+            goal=goal,
+            plan=plan,
+            ownership=ownership,
+        )
+        return TaskSubmissionReceipt(
+            plan=persisted_plan,
+            created=created,
+        )
+
     def pause_task(self, task_id: str) -> Task:
+        self._require_unowned_task(task_id)
         request_key = (self._database_key, task_id)
         with _CONTROL_LOCK:
             if _ACTIVE_TASK == request_key:
@@ -116,6 +192,7 @@ class TaskRuntime:
     def resume_task(
         self, task_id: str, *, memory_access: RetrievalContext | None = None
     ) -> Task:
+        self._require_unowned_task(task_id)
         self._require_context_runner()
         task = self.store.get_task(task_id)
         if task.state is TaskState.PAUSED:
@@ -123,6 +200,7 @@ class TaskRuntime:
         return self.run_task(task_id, memory_access=memory_access)
 
     def cancel_task(self, task_id: str) -> Task:
+        self._require_unowned_task(task_id)
         request_key = (self._database_key, task_id)
         with _CONTROL_LOCK:
             if _ACTIVE_TASK == request_key:
@@ -150,10 +228,57 @@ class TaskRuntime:
     def run_task(
         self, task_id: str, *, memory_access: RetrievalContext | None = None
     ) -> Task:
+        return self._run_task(task_id, memory_access=memory_access, authorization=None)
+
+    def run_authorized_task(
+        self,
+        task_id: str,
+        device: Device,
+        *,
+        policy: TaskSubmissionPolicy | None,
+        memory_access: RetrievalContext | None = None,
+    ) -> Task:
+        """Re-authorize the owning device before execution and dispatch handoff."""
+        ownership = self.store.get_task_ownership(task_id)
+        if ownership is None or ownership.device_id != device.id:
+            raise TaskAuthorizationError("Task execution is not authorized.")
+        task = self.store.get_task(task_id)
+        goal = self.store.get_goal(task.goal_id)
+        proposal = TaskSubmissionProposal(
+            idempotency_key=ownership.idempotency_key,
+            title=goal.title,
+            description=goal.description,
+        )
+        authorization = resolve_task_authorization(device, proposal, policy)
+        if authorization.request_digest != ownership.request_digest:
+            raise TaskAuthorizationError("Task execution is not authorized.")
+        if not callable(getattr(self.runner, "execute_authorized", None)):
+            raise TaskAuthorizationError("Authorized task execution is unavailable.")
+        return self._run_task(
+            task_id,
+            memory_access=memory_access,
+            authorization=authorization,
+        )
+
+    def _run_task(
+        self,
+        task_id: str,
+        *,
+        memory_access: RetrievalContext | None,
+        authorization: TaskAuthorizationContext | None,
+    ) -> Task:
         global _ACTIVE_TASK
         if self.memory_context_assembler is None and memory_access is not None:
             raise MemoryContextUnavailableError("Task memory context is not configured.")
-        self._require_context_runner()
+        ownership = self.store.get_task_ownership(task_id)
+        if ownership is not None and (
+            authorization is None
+            or ownership.device_id != authorization.device_id
+            or ownership.idempotency_key != authorization.idempotency_key
+            or ownership.request_digest != authorization.request_digest
+        ):
+            raise TaskAuthorizationError("Task execution is not authorized.")
+        self._require_context_runner(authorized=authorization is not None)
         if not _PROCESS_RUN_LOCK.acquire(blocking=False):
             raise RuntimeBusyError("A task is already being dispatched in this process.")
         request_key = (self._database_key, task_id)
@@ -161,7 +286,7 @@ class TaskRuntime:
             _ACTIVE_TASK = request_key
         try:
             memory_context = self._assemble_task_context(task_id, memory_access)
-            return self._run_task_locked(task_id, memory_context)
+            return self._run_task_locked(task_id, memory_context, authorization)
         finally:
             with _CONTROL_LOCK:
                 _ACTIVE_TASK = None
@@ -169,13 +294,18 @@ class TaskRuntime:
                 _CANCEL_REQUESTS.discard(request_key)
             _PROCESS_RUN_LOCK.release()
 
-    def _require_context_runner(self) -> None:
+    def _require_context_runner(self, *, authorized: bool = False) -> None:
+        method_name = "execute_authorized" if authorized else "execute_with_memory_context"
         if self.memory_context_assembler is not None and not callable(
-            getattr(self.runner, "execute_with_memory_context", None)
+            getattr(self.runner, method_name, None)
         ):
             raise MemoryContextUnavailableError(
                 "The configured step runner cannot receive task memory context."
             )
+
+    def _require_unowned_task(self, task_id: str) -> None:
+        if self.store.get_task_ownership(task_id) is not None:
+            raise TaskAuthorizationError("Task operation is not authorized.")
 
     def reconcile_step(
         self,
@@ -187,6 +317,7 @@ class TaskRuntime:
     ) -> Task:
         step = self.store.get_step(step_id)
         task = self.store.get_task(step.task_id)
+        self._require_unowned_task(task.id)
         if task.state is TaskState.RUNNING:
             self._recover_running_steps(task.id)
             if any(
@@ -228,7 +359,10 @@ class TaskRuntime:
             ) from exc
 
     def _run_task_locked(
-        self, task_id: str, memory_context: TaskMemoryContext | None = None
+        self,
+        task_id: str,
+        memory_context: TaskMemoryContext | None = None,
+        authorization: TaskAuthorizationContext | None = None,
     ) -> Task:
         task = self.store.get_task(task_id)
         if task.state in (
@@ -272,7 +406,7 @@ class TaskRuntime:
                     return self.store.transition_task(task_id, TaskState.FAILED)
                 if candidate.state in (StepState.PENDING, StepState.RETRY_WAIT):
                     candidate = self.store.transition_step(candidate.id, StepState.READY)
-                self._dispatch(candidate, memory_context)
+                self._dispatch(candidate, memory_context, authorization)
                 pause, cancel = self._requested_control(task_id)
                 current = self.store.get_step(candidate.id)
                 if current.state is StepState.RECONCILIATION_REQUIRED:
@@ -286,7 +420,10 @@ class TaskRuntime:
         return self.store.get_task(task_id)
 
     def _dispatch(
-        self, step: Step, memory_context: TaskMemoryContext | None = None
+        self,
+        step: Step,
+        memory_context: TaskMemoryContext | None = None,
+        authorization: TaskAuthorizationContext | None = None,
     ) -> None:
         attempt = self.store.start_step_attempt(step.id)
         if step.replay_safety.value == "idempotent" and not getattr(
@@ -299,7 +436,17 @@ class TaskRuntime:
             )
             return
         try:
-            if memory_context is None:
+            if authorization is not None:
+                execute_authorized = getattr(self.runner, "execute_authorized", None)
+                if not callable(execute_authorized):
+                    raise TaskAuthorizationError("Authorized task execution is unavailable.")
+                result = execute_authorized(
+                    step,
+                    idempotency_key=step.idempotency_key,
+                    authorization=authorization,
+                    memory_context=memory_context,
+                )
+            elif memory_context is None:
                 result = self.runner.execute(step, idempotency_key=step.idempotency_key)
             else:
                 execute_with_context = getattr(

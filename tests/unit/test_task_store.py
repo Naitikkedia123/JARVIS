@@ -59,12 +59,12 @@ def test_migration_ledger_and_foreign_key_enforcement(tmp_path) -> None:
     database = tmp_path / "migration.sqlite3"
     store = TaskStore(database)
 
-    assert store.schema_version == 2
+    assert store.schema_version == 3
     assert store._connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert [
         row["version"]
         for row in store._connection.execute("SELECT version FROM schema_migrations")
-    ] == [1, 2]
+    ] == [1, 2, 3]
 
     with pytest.raises(sqlite3.IntegrityError):
         store._connection.execute(
@@ -73,6 +73,25 @@ def test_migration_ledger_and_foreign_key_enforcement(tmp_path) -> None:
                 VALUES ('orphan', 'missing-goal', 'orphan', 'ready', 'test', 'x', 'x')"""
         )
     store.close()
+
+
+def test_v3_migration_preserves_legacy_tasks_without_implicit_owners(tmp_path) -> None:
+    database = tmp_path / "task-owner-migration.sqlite3"
+    store = TaskStore(database)
+    _, task, _ = seed_task(store)
+    store.close()
+
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE task_submissions")
+    connection.execute("DELETE FROM schema_migrations WHERE version = 3")
+    connection.commit()
+    connection.close()
+
+    upgraded = TaskStore(database)
+    assert upgraded.schema_version == 3
+    assert upgraded.get_task(task.id).id == task.id
+    assert upgraded.get_task_ownership(task.id) is None
+    upgraded.close()
 
 
 def test_database_persists_goal_plan_attempt_event_and_checkpoint_after_reopen(tmp_path) -> None:

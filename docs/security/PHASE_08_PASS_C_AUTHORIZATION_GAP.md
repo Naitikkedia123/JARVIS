@@ -1,6 +1,6 @@
 # Phase 08 Pass C — Task Synchronization Authorization Gap
 
-## Inspection result
+## Initial Pass C inspection result
 
 Pass C task submission and status retrieval cannot be enabled safely with the
 current task-runtime and API contracts. No task synchronization endpoint or
@@ -55,3 +55,21 @@ contract. This is a deliberate fail-closed result under the Pass C security
 requirements, not an implementation of task synchronization. Pass C remains
 incomplete and requires the contract above before its requested API capability
 can be built safely.
+
+## Follow-up: task authorization foundations
+
+The subsequent Phase 08 Task Authorization Foundation adds typed policy
+decisions and device-bound task authorization contexts, runtime submission and
+authorized-execution entry points, transactional task ownership and
+idempotency storage, and owner-scoped task lookup. Identical retries by the
+same device return the original plan; a changed request with the same key is a
+conflict. These foundations do not make the earlier HTTP capability available.
+
+Outstanding integration work remains: the API caller must authenticate an
+active device through `DeviceService` for each request; the application owner
+must inject a concrete, reviewed `TaskSubmissionPolicy`; and an authorized
+runner must map each planned operation to a `ToolRequest` and pass the policy
+context through `ToolDispatcher`. The repository still has no application
+runner adapter or task HTTP routes. Future task status handlers must use the
+owner-scoped store query. The primitives do not guarantee exactly-once task
+execution or external effects.

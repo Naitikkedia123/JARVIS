@@ -21,6 +21,14 @@ class TaskStoreError(TaskError):
     """Raised for safe, normalized persistence errors."""
 
 
+class TaskAuthorizationError(TaskError):
+    """A device task lacks a valid explicit policy authorization decision."""
+
+
+class TaskSubmissionConflictError(TaskError):
+    """An idempotency key was reused for a different request by the same device."""
+
+
 class DependencyNotSatisfiedError(TaskError):
     """Raised when a step is started before all dependencies succeeded."""
 
