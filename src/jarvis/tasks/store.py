@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
+from jarvis.tasks.authorization import TaskOwnership
 from jarvis.tasks.errors import (
     ActiveAttemptError,
     DependencyNotSatisfiedError,
@@ -24,6 +25,7 @@ from jarvis.tasks.errors import (
     InvalidTransitionError,
     RetryLimitExceededError,
     TaskStoreError,
+    TaskSubmissionConflictError,
 )
 from jarvis.tasks.models import (
     AttemptOutcome,
@@ -51,7 +53,7 @@ from jarvis.tasks.state import (
 )
 
 Clock = Callable[[], datetime]
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 _SCHEMA_V1 = (
     """CREATE TABLE goals (
@@ -159,6 +161,19 @@ _SCHEMA_V1 = (
 
 _SCHEMA_V2 = ("ALTER TABLE steps ADD COLUMN result_json TEXT",)
 
+_SCHEMA_V3 = (
+    """CREATE TABLE task_submissions (
+        device_id TEXT NOT NULL CHECK(length(device_id) = 32),
+        idempotency_key TEXT NOT NULL CHECK(length(idempotency_key) BETWEEN 16 AND 128),
+        request_digest TEXT NOT NULL CHECK(length(request_digest) = 64),
+        task_id TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(device_id, idempotency_key),
+        FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+    )""",
+    "CREATE INDEX task_submissions_task_id_idx ON task_submissions(task_id)",
+)
+
 
 def _json_dumps(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True)
@@ -213,7 +228,11 @@ class TaskStore:
             self._connection.rollback()
             raise
         else:
-            self._connection.commit()
+            try:
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
 
     def _migrate(self) -> None:
         self._connection.execute(
@@ -242,6 +261,15 @@ class TaskStore:
                 self._connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (2, self._now()),
+                )
+            applied.add(2)
+        if 3 not in applied:
+            with self._transaction():
+                for statement in _SCHEMA_V3:
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (3, self._now()),
                 )
 
     def _now(self) -> str:
@@ -282,111 +310,232 @@ class TaskStore:
         if goal.state is not GoalState.ACTIVE:
             raise TaskStoreError("A new goal must begin in the active state.")
         with self._transaction():
-            try:
-                self._connection.execute(
-                    """INSERT INTO goals(id, title, description, state, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?)""",
-                    (
-                        goal.id,
-                        goal.title,
-                        goal.description,
-                        goal.state.value,
-                        _timestamp(goal.created_at),
-                        _timestamp(goal.updated_at),
-                    ),
-                )
-            except sqlite3.IntegrityError:
-                raise TaskStoreError("Goal could not be stored due to a constraint violation.") from None
-            self._append_event(event_type=TaskEventType.GOAL_CREATED, goal_id=goal.id)
+            self._insert_goal(goal)
         return goal
+
+    def _insert_goal(self, goal: Goal) -> None:
+        if goal.state is not GoalState.ACTIVE:
+            raise TaskStoreError("A new goal must begin in the active state.")
+        try:
+            self._connection.execute(
+                """INSERT INTO goals(id, title, description, state, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    goal.id,
+                    goal.title,
+                    goal.description,
+                    goal.state.value,
+                    _timestamp(goal.created_at),
+                    _timestamp(goal.updated_at),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            raise TaskStoreError("Goal could not be stored due to a constraint violation.") from None
+        self._append_event(event_type=TaskEventType.GOAL_CREATED, goal_id=goal.id)
 
     def add_task_plan(self, task: Task, steps: Iterable[Step]) -> TaskPlan:
         step_list = list(steps)
+        candidate_ids = {step.id for step in step_list}
+        dependency_ids = {
+            dependency_id
+            for step in step_list
+            for dependency_id in step.dependencies
+            if dependency_id not in candidate_ids
+        }
+        for dependency_id in dependency_ids:
+            existing = self._connection.execute(
+                "SELECT task_id FROM steps WHERE id = ?", (dependency_id,)
+            ).fetchone()
+            if existing is not None:
+                raise InvalidDependencyError("Cross-task dependencies are not permitted.")
+            raise InvalidDependencyError("A dependency is missing from this task plan.")
+        plan = TaskPlan(task=task, steps=step_list)
+        with self._transaction():
+            self._insert_task_plan(plan)
+        return plan
+
+    def _insert_task_plan(self, plan: TaskPlan) -> None:
+        task = plan.task
+        step_list = plan.steps
         if task.state is not TaskState.READY:
             raise TaskStoreError("A new task must begin in the ready state.")
         if any(step.state is not StepState.PENDING for step in step_list):
             raise TaskStoreError("New plan steps must begin in the pending state.")
 
-        with self._transaction():
-            goal_row = self._connection.execute(
-                "SELECT id FROM goals WHERE id = ?", (task.goal_id,)
+        goal_row = self._connection.execute(
+            "SELECT id FROM goals WHERE id = ?", (task.goal_id,)
+        ).fetchone()
+        if goal_row is None:
+            raise EntityNotFoundError("The task goal does not exist.")
+
+        candidate_ids = {step.id for step in step_list}
+        dependency_ids = {
+            dependency_id
+            for step in step_list
+            for dependency_id in step.dependencies
+            if dependency_id not in candidate_ids
+        }
+        for dependency_id in dependency_ids:
+            existing = self._connection.execute(
+                "SELECT task_id FROM steps WHERE id = ?", (dependency_id,)
             ).fetchone()
-            if goal_row is None:
-                raise EntityNotFoundError("The task goal does not exist.")
+            if existing is not None:
+                raise InvalidDependencyError("Cross-task dependencies are not permitted.")
+            raise InvalidDependencyError("A dependency is missing from this task plan.")
 
-            candidate_ids = {step.id for step in step_list}
-            dependency_ids = {
-                dependency_id
-                for step in step_list
-                for dependency_id in step.dependencies
-                if dependency_id not in candidate_ids
-            }
-            for dependency_id in dependency_ids:
-                existing = self._connection.execute(
-                    "SELECT task_id FROM steps WHERE id = ?", (dependency_id,)
-                ).fetchone()
-                if existing is not None:
-                    raise InvalidDependencyError("Cross-task dependencies are not permitted.")
-                raise InvalidDependencyError("A dependency is missing from this task plan.")
-
-            plan = TaskPlan(task=task, steps=step_list)
-
-            try:
+        try:
+            self._connection.execute(
+                """INSERT INTO tasks
+                    (id, goal_id, title, state, planner_version, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    task.id,
+                    task.goal_id,
+                    task.title,
+                    task.state.value,
+                    task.planner_version,
+                    _timestamp(task.created_at),
+                    _timestamp(task.updated_at),
+                ),
+            )
+            self._append_event(
+                event_type=TaskEventType.TASK_CREATED,
+                goal_id=task.goal_id,
+                task_id=task.id,
+            )
+            for step in step_list:
                 self._connection.execute(
-                    """INSERT INTO tasks
-                        (id, goal_id, title, state, planner_version, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    """INSERT INTO steps
+                        (id, task_id, title, state, replay_safety, idempotency_key,
+                         attempt_limit, attempt_count, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
+                        step.id,
                         task.id,
-                        task.goal_id,
-                        task.title,
-                        task.state.value,
-                        task.planner_version,
-                        _timestamp(task.created_at),
-                        _timestamp(task.updated_at),
+                        step.title,
+                        step.state.value,
+                        step.replay_safety.value,
+                        step.idempotency_key,
+                        step.attempt_limit,
+                        step.attempt_count,
+                        _timestamp(step.created_at),
+                        _timestamp(step.updated_at),
                     ),
                 )
                 self._append_event(
-                    event_type=TaskEventType.TASK_CREATED,
+                    event_type=TaskEventType.STEP_CREATED,
                     goal_id=task.goal_id,
                     task_id=task.id,
+                    step_id=step.id,
+                    to_state=step.state.value,
                 )
-                for step in step_list:
+            for step in step_list:
+                for dependency_id in step.dependencies:
                     self._connection.execute(
-                        """INSERT INTO steps
-                            (id, task_id, title, state, replay_safety, idempotency_key,
-                             attempt_limit, attempt_count, created_at, updated_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            step.id,
-                            step.task_id,
-                            step.title,
-                            step.state.value,
-                            step.replay_safety.value,
-                            step.idempotency_key,
-                            step.attempt_limit,
-                            step.attempt_count,
-                            _timestamp(step.created_at),
-                            _timestamp(step.updated_at),
-                        ),
+                        """INSERT INTO step_dependencies(task_id, step_id, depends_on_step_id)
+                            VALUES (?, ?, ?)""",
+                        (task.id, step.id, dependency_id),
                     )
-                    self._append_event(
-                        event_type=TaskEventType.STEP_CREATED,
-                        goal_id=task.goal_id,
-                        task_id=task.id,
-                        step_id=step.id,
-                        to_state=step.state.value,
+        except sqlite3.IntegrityError:
+            raise TaskStoreError("Task plan could not be stored due to a constraint violation.") from None
+
+    def add_device_task_submission(
+        self,
+        *,
+        goal: Goal,
+        plan: TaskPlan,
+        ownership: TaskOwnership,
+    ) -> tuple[TaskPlan, bool]:
+        """Atomically persist a new owned task or return an identical retry.
+
+        Idempotency is scoped to `(device_id, idempotency_key)`. Reusing a key
+        for a different request digest raises a conflict. This covers durable
+        task creation only; it does not promise exactly-once task execution or
+        external effects.
+        """
+        if plan.task.goal_id != goal.id:
+            raise TaskStoreError("Task plan does not belong to its goal.")
+        with self._transaction():
+            existing = self._connection.execute(
+                """SELECT request_digest, task_id FROM task_submissions
+                    WHERE device_id = ? AND idempotency_key = ?""",
+                (ownership.device_id, ownership.idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_digest"] != ownership.request_digest:
+                    raise TaskSubmissionConflictError(
+                        "Submission idempotency key conflicts with an earlier request."
                     )
-                for step in step_list:
-                    for dependency_id in step.dependencies:
-                        self._connection.execute(
-                            """INSERT INTO step_dependencies(task_id, step_id, depends_on_step_id)
-                                VALUES (?, ?, ?)""",
-                            (task.id, step.id, dependency_id),
-                        )
+                return self._load_task_plan(str(existing["task_id"])), False
+
+            self._insert_goal(goal)
+            self._insert_task_plan(plan)
+            try:
+                self._connection.execute(
+                    """INSERT INTO task_submissions
+                        (device_id, idempotency_key, request_digest, task_id, created_at)
+                        VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        ownership.device_id,
+                        ownership.idempotency_key,
+                        ownership.request_digest,
+                        plan.task.id,
+                        self._now(),
+                    ),
+                )
             except sqlite3.IntegrityError:
-                raise TaskStoreError("Task plan could not be stored due to a constraint violation.") from None
-        return plan
+                raise TaskStoreError("Task submission could not be stored safely.") from None
+        return plan, True
+
+    def find_device_task_submission(self, ownership: TaskOwnership) -> TaskPlan | None:
+        """Return an identical prior submission or raise on key reuse conflict."""
+        row = self._connection.execute(
+            """SELECT request_digest, task_id FROM task_submissions
+                WHERE device_id = ? AND idempotency_key = ?""",
+            (ownership.device_id, ownership.idempotency_key),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["request_digest"] != ownership.request_digest:
+            raise TaskSubmissionConflictError(
+                "Submission idempotency key conflicts with an earlier request."
+            )
+        return self._load_task_plan(str(row["task_id"]))
+
+    def _load_task_plan(self, task_id: str) -> TaskPlan:
+        return TaskPlan(task=self.get_task(task_id), steps=self.list_steps(task_id))
+
+    def get_task_ownership(self, task_id: str) -> TaskOwnership | None:
+        row = self._connection.execute(
+            """SELECT device_id, idempotency_key, request_digest
+                FROM task_submissions WHERE task_id = ?""",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return TaskOwnership(
+                device_id=row["device_id"],
+                idempotency_key=row["idempotency_key"],
+                request_digest=row["request_digest"],
+            )
+        except (ValidationError, TypeError, ValueError):
+            raise TaskStoreError("Stored task ownership is invalid.") from None
+
+    def get_task_for_device(self, task_id: str, device_id: str) -> Task:
+        return self.get_task_plan_for_device(task_id, device_id).task
+
+    def get_task_plan_for_device(self, task_id: str, device_id: str) -> TaskPlan:
+        """Return plan state only when its owner matches the trusted device ID."""
+        row = self._connection.execute(
+            """SELECT tasks.id FROM tasks
+                JOIN task_submissions ON task_submissions.task_id = tasks.id
+                WHERE tasks.id = ? AND task_submissions.device_id = ?""",
+            (task_id, device_id),
+        ).fetchone()
+        if row is None:
+            raise EntityNotFoundError("Task was not found.")
+        return self._load_task_plan(task_id)
 
     def get_goal(self, goal_id: str) -> Goal:
         row = self._connection.execute("SELECT * FROM goals WHERE id = ?", (goal_id,)).fetchone()
