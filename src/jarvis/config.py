@@ -18,4 +18,7 @@ class Settings(BaseSettings):
     host: Literal["127.0.0.1"] = "127.0.0.1"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     device_database_path: Path = Path("data/local/devices.sqlite3")
+    task_database_path: Path = Path("data/local/tasks.sqlite3")
+    device_task_grants_path: Path = Path("data/local/device-task-grants.json")
+    task_submission_grants_path: Path = Path("data/local/task-submission-grants.json")
     device_bootstrap_code: SecretStr | None = None

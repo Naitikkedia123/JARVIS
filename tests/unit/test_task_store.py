@@ -1,8 +1,10 @@
 """SQLite migration, persistence, transaction, and audit tests."""
 
 import json
+import os
 import sqlite3
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -59,12 +61,12 @@ def test_migration_ledger_and_foreign_key_enforcement(tmp_path) -> None:
     database = tmp_path / "migration.sqlite3"
     store = TaskStore(database)
 
-    assert store.schema_version == 3
+    assert store.schema_version == 6
     assert store._connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert [
         row["version"]
         for row in store._connection.execute("SELECT version FROM schema_migrations")
-    ] == [1, 2, 3]
+    ] == [1, 2, 3, 4, 5, 6]
 
     with pytest.raises(sqlite3.IntegrityError):
         store._connection.execute(
@@ -75,20 +77,22 @@ def test_migration_ledger_and_foreign_key_enforcement(tmp_path) -> None:
     store.close()
 
 
-def test_v3_migration_preserves_legacy_tasks_without_implicit_owners(tmp_path) -> None:
+def test_v3_database_migrates_to_current_schema_without_implicit_owners(tmp_path) -> None:
     database = tmp_path / "task-owner-migration.sqlite3"
     store = TaskStore(database)
     _, task, _ = seed_task(store)
     store.close()
 
     connection = sqlite3.connect(database)
-    connection.execute("DROP TABLE task_submissions")
-    connection.execute("DELETE FROM schema_migrations WHERE version = 3")
+    connection.execute("DROP TABLE attempt_authorizations")
+    connection.execute("ALTER TABLE step_attempts DROP COLUMN dispatch_claimed_at")
+    connection.execute("ALTER TABLE steps DROP COLUMN action_json")
+    connection.execute("DELETE FROM schema_migrations WHERE version > 3")
     connection.commit()
     connection.close()
 
     upgraded = TaskStore(database)
-    assert upgraded.schema_version == 3
+    assert upgraded.schema_version == 6
     assert upgraded.get_task(task.id).id == task.id
     assert upgraded.get_task_ownership(task.id) is None
     upgraded.close()
@@ -318,7 +322,7 @@ def test_task_event_records_do_not_accept_arbitrary_exception_messages(tmp_path)
     store = TaskStore(tmp_path / "safe-events.sqlite3")
     _, _, step = seed_task(store)
     store.transition_step(step.id, StepState.READY)
-    store.start_step_attempt(step.id)
+    attempt = store.start_step_attempt(step.id)
     store.finish_step_attempt(
         step.id,
         AttemptOutcome.PERMANENT_FAILURE,
@@ -334,6 +338,7 @@ def test_task_event_records_do_not_accept_arbitrary_exception_messages(tmp_path)
     assert "exception_message" not in stored_metadata
     assert stored_metadata == {
         "attempt_number": 1,
+        "attempt_id": attempt.id,
         "error_code": "permanent",
         "outcome": "permanent_failure",
         "replay_safety": "pure",
@@ -341,3 +346,15 @@ def test_task_event_records_do_not_accept_arbitrary_exception_messages(tmp_path)
     with pytest.raises(sqlite3.IntegrityError):
         store._connection.execute("DELETE FROM task_events WHERE step_id = ?", (step.id,))
     store.close()
+
+
+def test_default_task_database_setting_uses_isolated_test_path(tmp_path) -> None:
+    from jarvis.config import Settings
+
+    configured_path = Path(os.path.abspath(os.environ["JARVIS_TASK_DATABASE_PATH"]))
+    temporary_root = Path(os.path.abspath(os.environ["TEMP"]))
+    production_default = Path(os.path.abspath(Path.cwd() / "data/local/tasks.sqlite3"))
+
+    assert configured_path != production_default
+    assert configured_path.is_relative_to(temporary_root)
+    assert Path(os.path.abspath(Settings().task_database_path)) == configured_path

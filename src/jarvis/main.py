@@ -2,7 +2,8 @@
 
 import logging
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -25,10 +26,79 @@ from jarvis.devices.store import (
     DeviceStoreError,
 )
 from jarvis.logging import configure_logging
+from jarvis.policy.allowlist import DeviceTaskToolPolicy
+from jarvis.policy.device_grants import LocalDeviceTaskGrantPolicy
+from jarvis.policy.task_submission import LocalTaskSubmissionPolicy
+from jarvis.tasks.api import TaskRequestSafetyMiddleware
+from jarvis.tasks.api import router as task_router
+from jarvis.tasks.authorization import TaskSubmissionPolicy
+from jarvis.tasks.errors import (
+    TaskAuthorizationError,
+    TaskStoreError,
+    TaskSubmissionConflictError,
+    TaskSubmissionPolicyUnavailableError,
+)
+from jarvis.tasks.planner import DeterministicPlanner
+from jarvis.tasks.runner import DispatcherBackedTaskRunner
+from jarvis.tasks.runtime import TaskRuntime
+from jarvis.tasks.store import TaskStore
+from jarvis.tools.dispatcher import InMemoryToolAuditSink, ToolDispatcher
+from jarvis.tools.registry import ToolRegistry
+from jarvis.tools.status import register_status_tool
 
 settings = Settings()
 configure_logging(settings.log_level)
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _TaskApplicationServices:
+    """Private lifespan-owned dependencies; routes expose only scoped operations."""
+
+    store: TaskStore
+    runtime: TaskRuntime
+    authorized_runner: DispatcherBackedTaskRunner | None
+    submission_policy: TaskSubmissionPolicy
+
+
+def _build_task_application_services(
+    settings: Settings,
+    device_service: DeviceService | None,
+    store: TaskStore,
+) -> _TaskApplicationServices:
+    runner: DispatcherBackedTaskRunner | None = None
+    if device_service is not None:
+        grant_policy = LocalDeviceTaskGrantPolicy(settings.device_task_grants_path)
+        registry = ToolRegistry()
+        status_executor = register_status_tool(registry)
+        dispatcher_policy = DeviceTaskToolPolicy(registry)
+        dispatcher = ToolDispatcher(
+            registry,
+            dispatcher_policy,
+            {"jarvis.status": status_executor},
+            InMemoryToolAuditSink(),
+        )
+        runner = DispatcherBackedTaskRunner(
+            device_service=device_service,
+            store=store,
+            dispatcher=dispatcher,
+            policy=grant_policy,
+        )
+
+    runtime = TaskRuntime(
+        store,
+        DeterministicPlanner(),
+        runner=None,
+        authorized_runner=runner,
+    )
+    return _TaskApplicationServices(
+        store=store,
+        runtime=runtime,
+        authorized_runner=runner,
+        submission_policy=LocalTaskSubmissionPolicy(
+            settings.task_submission_grants_path
+        ),
+    )
 
 
 def _error_response(
@@ -64,35 +134,47 @@ def create_app(
     *,
     device_service: DeviceService | None = None,
 ) -> FastAPI:
-    """Create the loopback API and manage its optional local device store lifecycle."""
+    """Create the loopback API and manage local device and task lifecycles."""
     resolved_settings = app_settings or Settings()
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         service = device_service
-        store: DeviceStore | None = None
-        database_path: Path = resolved_settings.device_database_path
-        # Do not create a local database on health/readiness-only starts unless
-        # bootstrap provisioning is configured. Existing device databases reopen.
-        if service is None and (
-            resolved_settings.device_bootstrap_code is not None or database_path.is_file()
-        ):
-            database_path.parent.mkdir(parents=True, exist_ok=True)
-            store = DeviceStore(database_path)
-            try:
+        device_store: DeviceStore | None = None
+        resources = ExitStack()
+        application.state.device_service = None
+        application.state._task_services = None
+        try:
+            database_path: Path = resolved_settings.device_database_path
+            # Do not create a local device database unless bootstrap provisioning
+            # is configured or an existing database needs to be reopened.
+            if service is None and (
+                resolved_settings.device_bootstrap_code is not None
+                or database_path.is_file()
+            ):
+                database_path.parent.mkdir(parents=True, exist_ok=True)
+                device_store = DeviceStore(database_path)
+                resources.callback(device_store.close)
                 service = DeviceService(
-                    store,
+                    device_store,
                     bootstrap_code=resolved_settings.device_bootstrap_code,
                 )
-            except Exception:
-                store.close()
-                raise
-        application.state.device_service = service
-        try:
+            task_database_path = resolved_settings.task_database_path
+            task_database_path.parent.mkdir(parents=True, exist_ok=True)
+            task_store = TaskStore(task_database_path)
+            resources.callback(task_store.close)
+            task_services = _build_task_application_services(
+                resolved_settings,
+                service,
+                task_store,
+            )
+            application.state.device_service = service
+            application.state._task_services = task_services
             yield
         finally:
-            if store is not None:
-                store.close()
+            application.state._task_services = None
+            application.state.device_service = None
+            resources.close()
 
     application = FastAPI(
         title="JARVIS",
@@ -101,7 +183,9 @@ def create_app(
         lifespan=lifespan,
     )
     application.add_middleware(DeviceRequestSizeLimitMiddleware)
+    application.add_middleware(TaskRequestSafetyMiddleware)
     application.include_router(device_router)
+    application.include_router(task_router)
     application.add_exception_handler(RequestValidationError, request_validation_error_handler)
 
     @application.exception_handler(StarletteHTTPException)
@@ -162,6 +246,46 @@ def create_app(
             503, "device_store_unavailable", "The device service is temporarily unavailable."
         )
 
+    @application.exception_handler(TaskAuthorizationError)
+    async def task_authorization_error(
+        request: Request, exc: TaskAuthorizationError
+    ) -> JSONResponse:
+        del request, exc
+        return _error_response(
+            403, "task_submission_denied", "Task submission is not authorized."
+        )
+
+    @application.exception_handler(TaskSubmissionConflictError)
+    async def task_submission_conflict_error(
+        request: Request, exc: TaskSubmissionConflictError
+    ) -> JSONResponse:
+        del request, exc
+        return _error_response(
+            409,
+            "task_submission_conflict",
+            "The idempotency key conflicts with an earlier submission.",
+        )
+
+    @application.exception_handler(TaskSubmissionPolicyUnavailableError)
+    async def task_submission_policy_unavailable(
+        request: Request, exc: TaskSubmissionPolicyUnavailableError
+    ) -> JSONResponse:
+        del request, exc
+        return _error_response(
+            503,
+            "task_submission_unavailable",
+            "Task submission is temporarily unavailable.",
+        )
+
+    @application.exception_handler(TaskStoreError)
+    async def task_store_error(request: Request, exc: TaskStoreError) -> JSONResponse:
+        del request, exc
+        return _error_response(
+            503,
+            "task_store_unavailable",
+            "Task submission is temporarily unavailable.",
+        )
+
     application.add_exception_handler(Exception, unexpected_error_handler)
 
     @application.get("/health", tags=["system"])
@@ -171,7 +295,7 @@ def create_app(
 
     @application.get("/ready", tags=["system"])
     def readiness() -> dict[str, str]:
-        """Return deterministic readiness; this scaffold has no external dependencies."""
+        """Report API readiness; this does not assert task execution availability."""
         return {"status": "ready", "service": "jarvis"}
 
     return application

@@ -43,7 +43,8 @@ class AuthorizationDeniedError(ToolError):
 class ToolAuditError(ToolError):
     safe_message = "Tool audit recording failed."
 
-    def __init__(self) -> None:
+    def __init__(self, *, executor_invoked: bool = False) -> None:
+        self.executor_invoked = executor_invoked
         super().__init__(self.safe_message)
 
 
@@ -100,5 +101,6 @@ class ToolTimeoutError(ToolError):
 class ToolExecutionError(ToolError):
     safe_message = "Tool execution failed."
 
-    def __init__(self) -> None:
+    def __init__(self, *, executor_invoked: bool = True) -> None:
+        self.executor_invoked = executor_invoked
         super().__init__(self.safe_message)

@@ -32,6 +32,20 @@ class ToolAuditOutcome(StrEnum):
     APPROVAL_FAILED = "approval_failed"
 
 
+class ToolExecutionCorrelation(BaseModel):
+    """Allowlisted identifiers connecting a dispatch audit event to a task attempt."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    task_id: str = Field(min_length=1, max_length=128)
+    step_id: str = Field(min_length=1, max_length=128)
+    action_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    attempt_id: str = Field(min_length=1, max_length=128)
+    attempt_number: int = Field(ge=1, le=10)
+    device_id: str = Field(min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$")
+    authorization_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -101,6 +115,7 @@ class ToolAuditEvent(BaseModel):
     outcome: ToolAuditOutcome
     reason_code: str = Field(min_length=1, max_length=64)
     duration_ms: int | None = Field(default=None, ge=0)
+    correlation: ToolExecutionCorrelation | None = None
 
     @field_validator("occurred_at")
     @classmethod
