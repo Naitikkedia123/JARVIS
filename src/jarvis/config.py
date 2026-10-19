@@ -1,8 +1,9 @@
 """Typed, local-first application settings."""
 
+from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,3 +17,5 @@ class Settings(BaseSettings):
     )
     host: Literal["127.0.0.1"] = "127.0.0.1"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    device_database_path: Path = Path("data/local/devices.sqlite3")
+    device_bootstrap_code: SecretStr | None = None
