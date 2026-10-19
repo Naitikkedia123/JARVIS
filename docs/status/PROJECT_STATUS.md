@@ -1,9 +1,9 @@
 # JARVIS Project Status
 
-**Last updated:** Phase 06 owner acceptance — 18 October 2026
-**Current stage:** Phase 06 — Research, Sources and Browser Tools accepted; implementation remains on its feature branch
-**Current branch:** `feat/research-browser-tools`
-**Status:** Phases 00–05 retain their accepted historical status. Phase 04 was merged into `main` through PR #2, squash commit `a492fbe`; Phase 05 was merged into `main` through PR #3, squash commit `43fcf0b`. Phase 06 is accepted by the owner but remains on `feat/research-browser-tools`; it has not been committed, pushed, merged or released.
+**Last updated:** Phase 07 memory retrieval and context assembly implementation — 18 October 2026
+**Current stage:** Phase 07 — memory retrieval and task-context assembly in progress
+**Current branch:** `feat/memory-context-assembly`
+**Status:** Phases 00–05 retain their accepted historical status. Phase 04 was merged into `main` through PR #2, squash commit `a492fbe`; Phase 05 was merged through PR #3, squash commit `43fcf0b`; Phase 06 was merged through PR #4, squash commit `4c07bd4`. Phase 07 implementation is in progress on the current feature branch and is not yet accepted.
 
 ## Phase 00 completed work (2026-10-17)
 - Prepared `docs/decisions/0001-architecture-choice.md` with a weighted A/B/C scorecard (weights total 100%), evidence, trade-offs, and reversal criteria. Recommendation: JARVIS-owned Python control plane with selective adapters; evaluate OpenClaw as an external local Gateway before considering a fork.
@@ -34,7 +34,7 @@
 - Windows automation, Android, communication integrations, voice, and vision.
 
 ## Next task
-Phase 05 is accepted. The next phase remains pending separate owner direction.
+Phase 07 memory retrieval and context assembly is in progress. Independent review and owner acceptance remain pending.
 
 ## Earlier checks before Phase 01 acceptance
 - `scripts/check.ps1` under Python 3.13: passed; Ruff passed and 12 tests passed, with 1 third-party deprecation warning.
@@ -97,7 +97,7 @@ The preceding check sections preserve earlier agent-session observations. The fi
 - Full-text retrieval uses SQLite FTS5 when available and a parameterized, escaped `LIKE` fallback otherwise. Metadata filters and full-text results share the same access-control and current-validity filters. Correction preserves the previous version as superseded; deleting a replacement does not reactivate its predecessor. Deletion removes the selected database row and its search entry.
 - Added deterministic local tests for validation, provenance, authorization, ID non-disclosure, validity windows, full-text/metadata retrieval, correction/deletion, rollback, migrations, and close/reopen persistence.
 - Owner-provided Python 3.12.4 validation: 28 focused memory tests passed; the full suite reported 180 passed and 2 skipped; Ruff and `git diff --check` passed. The two skipped tests require symlink creation, which Windows policy prevented, so those scenarios were not dynamically tested. Python 3.13.1 validation was also reported as passing: 28 focused memory tests, 180 passed and 2 skipped in the full suite, Ruff and `git diff --check`; the full run reported one existing Starlette/httpx deprecation warning. A separate implementation-agent environment could not independently reproduce the Python 3.12.4 run; the owner subsequently verified Python 3.12.4 successfully in the repository's VS Code terminal.
-- Access contexts remain trusted caller inputs, not authentication. SQLite deletion removes the row and search entry but does not guarantee forensic erasure from database pages, WAL files, backups or storage media. No embeddings, external services, model calls, background jobs, memory API routes or task-gateway wiring were added; production readiness is not claimed.
+- Access contexts remain trusted caller inputs, not authentication. SQLite deletion removes the row and search entry but does not guarantee forensic erasure from database pages, WAL files, backups or storage media. Phase 05 added no embeddings, external services, model calls, background jobs, memory API routes or automatic task-gateway wiring; Phase 07's optional context handoff is recorded below. Production readiness is not claimed.
 - Phase 05 was accepted by the owner on `feat/memory-v1` and subsequently merged into `main` through PR #3, squash commit `43fcf0b`.
 
 ## Phase 06 — Research, Sources and Browser Tools (accepted)
@@ -105,4 +105,11 @@ The preceding check sections preserve earlier agent-session observations. The fi
 - Retrieval uses a TLS 1.2 minimum, certificate-chain and hostname verification with the system trust store, and an explicit cipher policy for TLS 1.2 and earlier; TLS 1.3 remains governed by platform/OpenSSL defaults. Redirects, environment proxies and keep-alive reuse are disabled. Network time and streamed response size, extracted text, titles, excerpts and summaries are bounded. Errors are normalized safely; source metadata and provenance are retained, retrieved content remains untrusted, and audit payloads omit URLs and page content.
 - Passes A–D received independent security reviews. The owner accepted Phase 06 after those passes and reviews. Latest owner-reported Python 3.13.1 validation: focused browser tests, 59 passed; full suite, 239 passed and 2 skipped; Ruff and whitespace checks passed. The run reported one existing Starlette/httpx deprecation warning. The skipped symlink tests require symlink creation, which the current Windows policy blocked; those scenarios were not dynamically tested.
 - Tests used mocked DNS and HTTP/TLS transport; no real DNS/network request or live TLS handshake was used. Trusted exact IP lists need deliberate review when CDN addresses change and must not be expanded automatically. The default OS `getaddrinfo` work may continue in its executor thread after the caller's timed wait expires. An explicitly approved endpoint could later become hostile or compromised. Application controls do not guarantee comprehensive SSRF protection; host and network egress controls remain useful independent safeguards.
-- Phase 06 is accepted but remains uncommitted, unpushed, unmerged and unreleased on `feat/research-browser-tools`. This does not claim that JARVIS is a complete autonomous assistant. The next phase remains pending separate owner direction.
+- Phase 06 is accepted and was merged into `main` through PR #4, squash commit `4c07bd4`. This does not claim that JARVIS is a complete autonomous assistant.
+
+## Phase 07 — Memory Retrieval and Context Assembly (implementation in progress)
+- The implementation adds an optional bounded context assembler using the existing Phase 05 SQLite retriever and a task-runtime handoff through a context-aware runner. Retrieved memories remain untrusted data; the integration does not authorize tools, alter policy, persist assembled context or call a model/provider.
+- Retrieval honors the existing caller-supplied `RetrievalContext` and store filters. It returns an empty context for no authorized scope or no suitable memories, ranks by lexical overlap (title matches count twice; record ID breaks ties), deduplicates candidates by record ID, and caps output at 8 records, 4,000 serialized characters per record and 12,000 rendered context characters.
+- Python 3.13.1 validation: focused memory-context, runtime and memory tests, 54 passed; full suite, 253 passed and 2 skipped, with one existing Starlette/httpx deprecation warning. The skipped workspace/tool tests require symlink creation, which current Windows policy blocked. Ruff passed for `src/jarvis` and `tests`; `git diff --check` passed. `scripts/check.ps1 -VenvPath ".venv"` stopped before running checks because the configured interpreter is Python 3.13.1 and that script requires Python 3.12.
+- Implementation commit `3468cd1` was pushed to `origin/feat/memory-context-assembly`. A pull request has not yet been opened because this environment has no GitHub CLI or browser session; the remote provided [this PR creation link](https://github.com/Naitikkedia123/JARVIS/pull/new/feat/memory-context-assembly).
+- Access contexts remain trusted caller inputs, not authentication. SQLite deletion still does not guarantee forensic erasure. Independent review and owner acceptance are pending; no later phase is claimed complete.
