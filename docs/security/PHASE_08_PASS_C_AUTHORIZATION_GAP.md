@@ -73,3 +73,44 @@ context through `ToolDispatcher`. The repository still has no application
 runner adapter or task HTTP routes. Future task status handlers must use the
 owner-scoped store query. The primitives do not guarantee exactly-once task
 execution or external effects.
+
+## Pass C authorized-execution review (2026-10-19)
+
+The authorization foundation still cannot be connected safely to tool
+execution without additional architecture decisions. This pass adds no runner
+adapter and no task endpoints. The precise blockers are:
+
+1. **No typed planned action:** `Step` contains a title, dependency IDs and
+   replay metadata, while `DeterministicPlanner` emits a generic text step.
+   There is no trusted structured intent naming a tool and validated
+   arguments. Deriving tool names or arguments from task text, model output,
+   memory or reported device capabilities would let untrusted content select
+   actions.
+2. **No explicit grant policy:** `TaskSubmissionPolicy` is only an injected
+   protocol. Application startup has no reviewed per-device policy source or
+   approved narrow tool/capability set. Role and self-reported capability
+   fields remain descriptive; no permissive default was introduced.
+3. **No enforceable dispatcher integration:** `AuthorizedStepRunner` is a
+   caller-implemented protocol. `TaskRuntime` passes it an authorization
+   context but cannot establish that it invokes `ToolDispatcher`. In addition,
+   task runtime calls are synchronous and `ToolDispatcher.dispatch()` is
+   asynchronous; there is no established invocation model safe for both
+   synchronous execution and a future async API.
+4. **No safe approval lifecycle:** approval requests are volatile in-memory
+   pending records. The service has no trusted decision operation, expiry or
+   single-use consumption; the task store has no approval-waiting state or
+   atomic approval/task linkage. A dispatcher approval exception currently
+   follows the generic uncertain-outcome path. A client-provided “approved”
+   claim or retry cannot safely resume the task.
+
+The existing foundations continue to reject missing/denied/mismatched policy
+contexts, reject legacy lifecycle calls for owned tasks, preserve owner-scoped
+status queries and create task ownership/idempotency records transactionally.
+Existing tests cover those foundations, dispatcher denial, unavailable
+approval handling, pre-execution audit failure, immutable authorization
+contexts, and concurrent same-device submission using two SQLite connections
+synchronized before the transactional insert. They do not prove an
+end-to-end authorized task-to-tool flow or an approval wait/resume flow. The
+application must not expose device-owned execution until the four blockers
+above are resolved. Status handlers must continue to query by both task ID and
+authenticated device ID when a later pass adds them.
