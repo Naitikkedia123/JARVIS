@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from threading import Barrier
 
 import pytest
 from pydantic import SecretStr, ValidationError
@@ -14,6 +16,7 @@ from jarvis.devices.service import (
     DeviceAuthenticationError,
     DeviceAuthorizationError,
     DeviceService,
+    generate_bootstrap_code,
 )
 from jarvis.devices.store import (
     DevicePairingUnavailableError,
@@ -79,6 +82,38 @@ def test_bootstrap_pairing_persists_identity_and_only_token_digest(tmp_path) -> 
     reopened.close()
 
 
+def test_generated_bootstrap_code_is_secret_wrapped_and_usable_once(tmp_path, monkeypatch) -> None:
+    generated = "secure-generated-bootstrap-value-0123456789"
+    calls = []
+
+    def token_urlsafe(nbytes):
+        calls.append(nbytes)
+        return generated
+
+    monkeypatch.setattr("jarvis.devices.service.secrets.token_urlsafe", token_urlsafe)
+    bootstrap_code = generate_bootstrap_code()
+    assert calls == [32]
+    assert isinstance(bootstrap_code, SecretStr)
+    assert repr(bootstrap_code) != generated
+
+    database = tmp_path / "generated-bootstrap.sqlite3"
+    store = DeviceStore(database)
+    service = DeviceService(store, bootstrap_code=bootstrap_code, clock=lambda: NOW)
+    owner = service.pair(
+        bootstrap_code,
+        name="owner",
+        platform=DevicePlatform.WINDOWS,
+    )
+    assert owner.device.role is DeviceRole.OWNER
+    digest = hashlib.sha256(generated.encode()).hexdigest()
+    assert store._connection.execute(
+        "SELECT code_digest FROM pairing_codes"
+    ).fetchone()[0] == digest
+    with pytest.raises(DevicePairingUnavailableError, match="invalid or unavailable"):
+        service.pair(bootstrap_code, name="replay", platform=DevicePlatform.WEB)
+    store.close()
+
+
 def test_owner_can_pair_member_issue_code_and_revoke_member(tmp_path) -> None:
     store, service = make_service(tmp_path / "lifecycle.sqlite3")
     owner = pair_owner(service)
@@ -118,6 +153,50 @@ def test_owner_can_pair_member_issue_code_and_revoke_member(tmp_path) -> None:
     assert revoked.revoked_at == NOW
     with pytest.raises(DeviceAuthenticationError, match="authentication failed"):
         service.authenticate(member.access_token)
+    store.close()
+
+
+def test_concurrent_companion_code_issuance_leaves_only_latest_code_usable(tmp_path) -> None:
+    database = tmp_path / "concurrent-codes.sqlite3"
+    store, service = make_service(database)
+    owner = pair_owner(service)
+    barrier = Barrier(2)
+
+    def issue_concurrently() -> str:
+        worker_store = DeviceStore(database, clock=lambda: NOW)
+        worker_service = DeviceService(worker_store, bootstrap_code=None, clock=lambda: NOW)
+        original_issue = worker_store.issue_pairing_code
+
+        def wait_before_issue(owner_id, code_digest, expires_at):
+            barrier.wait(timeout=5)
+            return original_issue(owner_id, code_digest, expires_at)
+
+        worker_store.issue_pairing_code = wait_before_issue
+        try:
+            return worker_service.issue_pairing_code(owner.access_token).get_secret_value()
+        finally:
+            worker_store.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        codes = list(executor.map(lambda _: issue_concurrently(), range(2)))
+
+    assert store._connection.execute(
+        "SELECT COUNT(*) FROM pairing_codes WHERE owner_device_id = ? AND used_at IS NULL",
+        (owner.device.id,),
+    ).fetchone()[0] == 1
+    paired = []
+    for index, code in enumerate(codes):
+        try:
+            paired.append(
+                service.pair(
+                    SecretStr(code),
+                    name=f"companion-{index}",
+                    platform=DevicePlatform.ANDROID,
+                )
+            )
+        except DevicePairingUnavailableError:
+            pass
+    assert len(paired) == 1
     store.close()
 
 
@@ -266,6 +345,7 @@ def test_revocation_survives_database_reopen_and_owner_cannot_revoke_itself(tmp_
     store.close()
 
     reopened, restored = make_service(database)
+    assert reopened.get_device(member.device.id, active_only=False).revoked_at == NOW
     with pytest.raises(DeviceAuthenticationError, match="authentication failed"):
         restored.authenticate(member.access_token)
     assert restored.authenticate(owner.access_token).role is DeviceRole.OWNER

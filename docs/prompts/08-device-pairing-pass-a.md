@@ -8,7 +8,7 @@ Provide a local, persistent device identity and pairing service that later API r
 
 - Typed device, platform, role, pairing metadata, and capability-report models with bounded fields and UTC timestamps.
 - File-backed SQLite storage with an injectable path and a versioned migration ledger.
-- One explicit bootstrap pairing code (minimum 32 characters), consumed atomically once to establish the owner device. The caller must provide it out of band; length alone does not prove entropy.
+- One explicit bootstrap pairing code, consumed atomically once to establish the owner device. Trusted provisioning code can generate a high-entropy `SecretStr` with `generate_bootstrap_code()` (`secrets.token_urlsafe(32)`). The caller must securely deliver it once to the intended owner and supply it to `DeviceService`; the minimum-length check is only a format bound and does not prove entropy.
 - Random bearer tokens issued once, with only SHA-256 digests persisted. Active tokens authenticate to a typed device record; revocation survives database reopen.
 - An owner can list devices, issue a random five-minute single-use companion pairing code, and revoke companions. Owner credentials cannot revoke the owner device.
 - Device-reported capability labels are untrusted descriptive metadata only. They cannot grant tool, task, or API authorization.
@@ -18,7 +18,7 @@ Provide a local, persistent device identity and pairing service that later API r
 
 - No FastAPI routes, authentication middleware, changes to the listener, or remote access in Pass A. Existing `/health` and `/ready` remain loopback liveness endpoints.
 - No task submit/status/cancel API, notification stream, offline-state model, Android project/UI, VPN, TLS termination, account integration, or production deployment configuration.
-- No automatic bootstrap-code generation, credential recovery, owner reset, token expiry, encryption at rest, or claim of forensic erasure.
+- No automatic bootstrap-code generation or delivery, credential recovery, owner reset, token expiry, encryption at rest, or claim of forensic erasure. A trusted caller remains responsible for provisioning and protecting the generated plaintext secret.
 
 ## Reused interfaces and boundaries
 

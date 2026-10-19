@@ -12,6 +12,7 @@ from jarvis.devices.service import (
     DeviceAuthenticationError,
     DeviceAuthorizationError,
     DeviceService,
+    generate_bootstrap_code,
 )
 from jarvis.devices.store import (
     DeviceNotFoundError,
@@ -32,6 +33,7 @@ __all__ = [
     "DeviceService",
     "DeviceStore",
     "DeviceStoreError",
+    "generate_bootstrap_code",
     "PairingMetadata",
     "PairingReceipt",
 ]

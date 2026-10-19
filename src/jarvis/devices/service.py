@@ -27,6 +27,15 @@ PAIRING_CODE_TTL = timedelta(minutes=5)
 MIN_BOOTSTRAP_CODE_LENGTH = 32
 
 
+def generate_bootstrap_code() -> SecretStr:
+    """Generate a high-entropy bootstrap code for trusted out-of-band provisioning.
+
+    The caller must securely deliver the returned secret to the intended owner and
+    supply it to ``DeviceService``. The service stores only its digest.
+    """
+    return SecretStr(secrets.token_urlsafe(32))
+
+
 class DeviceAuthenticationError(RuntimeError):
     """Authentication failed without disclosing whether a device exists."""
 
