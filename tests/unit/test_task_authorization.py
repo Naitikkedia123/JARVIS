@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from threading import Barrier
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -162,6 +164,21 @@ def test_missing_denied_or_failing_policy_creates_no_task(tmp_path, policy) -> N
     store.close()
 
 
+def test_resolved_authorization_context_cannot_be_mutated() -> None:
+    context = resolve_task_authorization(device(), proposal(), AllowPolicy())
+
+    with pytest.raises(ValidationError):
+        context.device_id = "f" * 32
+    with pytest.raises(ValidationError):
+        context.tool_authorization.principal_id = "f" * 32
+    with pytest.raises(AttributeError):
+        context.tool_authorization.granted_capabilities.add("tool:write")
+
+    assert context.device_id == "a" * 32
+    assert context.tool_authorization.principal_id == "a" * 32
+    assert context.tool_authorization.granted_capabilities == frozenset()
+
+
 def test_policy_context_must_be_bound_to_authenticated_device(tmp_path) -> None:
     class MissingContextPolicy:
         def authorize(self, *, device_id: str, proposal: TaskSubmissionProposal):
@@ -218,6 +235,41 @@ def test_idempotent_retries_return_original_task_and_conflicts_fail(tmp_path) ->
     recovered = recovered_runtime.submit_device_task(paired, proposal(), policy=policy)
     assert recovered.created is False
     assert recovered.plan == first.plan
+    reopened.close()
+
+
+def test_concurrent_same_device_submissions_create_one_task(tmp_path) -> None:
+    database = tmp_path / "concurrent-task-submission.sqlite3"
+    bootstrap = TaskStore(database)
+    bootstrap.close()
+    planner_barrier = Barrier(2)
+
+    class SynchronizedPlanner:
+        version = DeterministicPlanner.version
+
+        def plan(self, goal):
+            plan = DeterministicPlanner().plan(goal)
+            planner_barrier.wait(timeout=5)
+            return plan
+
+    def submit_once():
+        store = TaskStore(database)
+        try:
+            runtime = TaskRuntime(store, SynchronizedPlanner(), AuthorizedRunner())
+            return runtime.submit_device_task(
+                device(), proposal(), policy=AllowPolicy()
+            )
+        finally:
+            store.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: submit_once(), range(2)))
+
+    assert sorted(result.created for result in results) == [False, True]
+    assert results[0].plan == results[1].plan
+    reopened = TaskStore(database)
+    assert reopened._connection.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
+    assert reopened._connection.execute("SELECT count(*) FROM task_submissions").fetchone()[0] == 1
     reopened.close()
 
 

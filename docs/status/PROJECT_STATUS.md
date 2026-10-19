@@ -118,3 +118,10 @@ The preceding check sections preserve earlier agent-session observations. The fi
 - Pass A adds a file-backed SQLite device registry, a one-use bootstrap pairing code, hashed bearer credentials, owner-issued short-lived companion pairing codes, owner-only device listing/revocation, and self-reported capability metadata. Capability reports are descriptive and do not grant tool or task permissions.
 - Pass A is an internal service foundation only. It adds no FastAPI routes, changes no listener, and does not yet enforce authentication on new network operations. The existing API remains loopback-only. Device API/task synchronization, events/offline state, and Android UI are deferred to subsequent slices.
 - Pass A is not accepted. Independent review and owner acceptance are pending.
+
+### Pass C — Authorized task execution (blocked at the execution boundary)
+
+- PR #9 merged trusted task-authorization context, transactional device ownership and same-device submission idempotency, and scoped task lookups. These primitives remain in place.
+- The authorized runtime hook rechecks policy and rejects legacy lifecycle calls for device-owned tasks, but there is no safe task-to-tool implementation: planned steps have no typed action, there is no configured narrow task policy, the runtime cannot enforce that a runner uses the dispatcher, and the synchronous runtime has no defined safe bridge to the async dispatcher.
+- Approval remains unresolved. The current service is volatile and pending-only, with no trusted decision or durable waiting/resume state. No approval simulation or task HTTP endpoint was added.
+- See [the Pass C authorization gap](../security/PHASE_08_PASS_C_AUTHORIZATION_GAP.md) for the exact decisions required. Device task synchronization remains incomplete and gated.
