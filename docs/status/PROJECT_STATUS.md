@@ -1,9 +1,9 @@
 # JARVIS Project Status
 
-**Last updated:** Phase 07 memory retrieval and context assembly implementation — 18 October 2026
-**Current stage:** Phase 07 — memory retrieval and task-context assembly in progress
-**Current branch:** `feat/memory-context-assembly`
-**Status:** Phases 00–05 retain their accepted historical status. Phase 04 was merged into `main` through PR #2, squash commit `a492fbe`; Phase 05 was merged through PR #3, squash commit `43fcf0b`; Phase 06 was merged through PR #4, squash commit `4c07bd4`. Phase 07 implementation is in progress on the current feature branch and is not yet accepted.
+**Last updated:** Phase 08 device-pairing foundation work — 19 October 2026
+**Current stage:** Phase 08 — persistent device identity and pairing foundation (Pass A)
+**Current branch:** `feat/phase-08-device-pairing`
+**Status:** Phases 00–06 retain their accepted historical status. Phase 07 was merged into `main` through PR #5, squash commit `99b4953`. Phase 08 Pass A is in progress on the current feature branch; Phase 08 is not accepted.
 
 ## Phase 00 completed work (2026-10-17)
 - Prepared `docs/decisions/0001-architecture-choice.md` with a weighted A/B/C scorecard (weights total 100%), evidence, trade-offs, and reversal criteria. Recommendation: JARVIS-owned Python control plane with selective adapters; evaluate OpenClaw as an external local Gateway before considering a fork.
@@ -34,7 +34,7 @@
 - Windows automation, Android, communication integrations, voice, and vision.
 
 ## Next task
-Phase 07 memory retrieval and context assembly is in progress. Independent review and owner acceptance remain pending.
+Complete review and validation for Phase 08 Pass A, then proceed with authenticated API integration and task/event synchronization as separate slices. Android UI follows only after the server-side API contract is reviewed.
 
 ## Earlier checks before Phase 01 acceptance
 - `scripts/check.ps1` under Python 3.13: passed; Ruff passed and 12 tests passed, with 1 third-party deprecation warning.
@@ -107,9 +107,14 @@ The preceding check sections preserve earlier agent-session observations. The fi
 - Tests used mocked DNS and HTTP/TLS transport; no real DNS/network request or live TLS handshake was used. Trusted exact IP lists need deliberate review when CDN addresses change and must not be expanded automatically. The default OS `getaddrinfo` work may continue in its executor thread after the caller's timed wait expires. An explicitly approved endpoint could later become hostile or compromised. Application controls do not guarantee comprehensive SSRF protection; host and network egress controls remain useful independent safeguards.
 - Phase 06 is accepted and was merged into `main` through PR #4, squash commit `4c07bd4`. This does not claim that JARVIS is a complete autonomous assistant.
 
-## Phase 07 — Memory Retrieval and Context Assembly (implementation in progress)
+## Phase 07 — Memory Retrieval and Context Assembly (merged)
 - The implementation adds an optional bounded context assembler using the existing Phase 05 SQLite retriever and a task-runtime handoff through a context-aware runner. Retrieved memories remain untrusted data; the integration does not authorize tools, alter policy, persist assembled context or call a model/provider.
 - Retrieval honors the existing caller-supplied `RetrievalContext` and store filters. It returns an empty context for no authorized scope or no suitable memories, ranks by lexical overlap (title matches count twice; record ID breaks ties), deduplicates candidates by record ID, and caps output at 8 records, 4,000 serialized characters per record and 12,000 rendered context characters.
 - Python 3.13.1 validation: focused memory-context, runtime and memory tests, 54 passed; full suite, 253 passed and 2 skipped, with one existing Starlette/httpx deprecation warning. The skipped workspace/tool tests require symlink creation, which current Windows policy blocked. Ruff passed for `src/jarvis` and `tests`; `git diff --check` passed. `scripts/check.ps1 -VenvPath ".venv"` stopped before running checks because the configured interpreter is Python 3.13.1 and that script requires Python 3.12.
-- Implementation commit `3468cd1` was pushed to `origin/feat/memory-context-assembly`. A pull request has not yet been opened because this environment has no GitHub CLI or browser session; the remote provided [this PR creation link](https://github.com/Naitikkedia123/JARVIS/pull/new/feat/memory-context-assembly).
-- Access contexts remain trusted caller inputs, not authentication. SQLite deletion still does not guarantee forensic erasure. Independent review and owner acceptance are pending; no later phase is claimed complete.
+- The owner merged Phase 07 into `main` through PR #5, squash commit `99b4953`. Access contexts remain trusted caller inputs, not authentication. SQLite deletion still does not guarantee forensic erasure. This phase adds no autonomous execution.
+
+## Phase 08 — Cross-Device API and Android Companion (Pass A in progress)
+- The roadmap defines authenticated device pairing/registry, capability reporting, task submit/status/cancel, notification events and offline behavior, followed by a minimal Android client. The work is split into reviewed backend and client slices; this branch begins with persistent device identity and pairing primitives.
+- Pass A adds a file-backed SQLite device registry, a one-use bootstrap pairing code, hashed bearer credentials, owner-issued short-lived companion pairing codes, owner-only device listing/revocation, and self-reported capability metadata. Capability reports are descriptive and do not grant tool or task permissions.
+- Pass A is an internal service foundation only. It adds no FastAPI routes, changes no listener, and does not yet enforce authentication on new network operations. The existing API remains loopback-only. Device API/task synchronization, events/offline state, and Android UI are deferred to subsequent slices.
+- Pass A is not accepted. Independent review and owner acceptance are pending.

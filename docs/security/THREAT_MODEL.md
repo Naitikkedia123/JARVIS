@@ -72,4 +72,12 @@ Private files, source code, account credentials, model credentials (if later add
 - A configured runtime delivers context only through `execute_with_memory_context`. It does not add capabilities, alter the authorization context, register tools, invoke a dispatcher, or automatically save retrieved text. Retrieval failures are normalized to a safe runtime error before a step attempt starts; the task remains retryable and the runner is not called. Existing runner behavior is unchanged when context assembly is not configured.
 - Task-memory context assembly has no model/provider call, API route, browser-to-memory persistence, or user authentication flow. Any future runner that forwards memory to a model must keep it separate from privileged instructions and use only an explicitly permitted provider. Context and memory storage remain local to the existing SQLite store; SQLite deletion does not guarantee forensic erasure. No production-readiness claim is made.
 
+## Phase 08 Pass A: device identity and pairing foundation
+
+- The device service is a trusted in-process foundation and is not wired to FastAPI routes. It does not change the listener; the API continues to bind only to `127.0.0.1`. No remote device can use this service over the network in this pass.
+- Bootstrap pairing requires an explicitly supplied code of at least 32 characters; there is no built-in default. The bootstrap code is consumed once and only its SHA-256 digest is stored. An active owner device can create five-minute, one-use companion pairing codes and can list or revoke companion devices.
+- Each pairing generates a random bearer token returned once in a secret wrapper. SQLite stores only its SHA-256 digest. Tokens have no expiry in Pass A; revocation is persistent and irreversible through this service. The owner device cannot revoke itself. Loss of the owner credential has no recovery/reset workflow in this pass.
+- Device names, platform and reported capabilities are untrusted metadata. Reported capabilities do not grant tool, task or API permissions and must never be used as authorization evidence. Protected API routes, request authentication, task synchronization, event delivery, offline state and Android client behavior are not implemented yet.
+- The database contains device metadata and credential digests in plaintext SQLite pages; file access depends on operating-system controls. No encryption-at-rest or forensic-erasure guarantee is made.
+
 Update this document whenever an integration or permission is introduced.
