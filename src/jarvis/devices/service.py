@@ -163,6 +163,48 @@ class DeviceService:
         except DeviceNotFoundError as exc:
             raise DeviceAuthenticationError("Device authentication failed.") from exc
 
+    @contextmanager
+    def reserve_task_device(
+        self,
+        access_token: SecretStr,
+        *,
+        expected_device_id: str,
+    ) -> Iterator[Device]:
+        """Keep a task owner's current credential valid through a task commit."""
+        if not isinstance(access_token, SecretStr):
+            raise DeviceAuthenticationError("Device authentication failed.")
+        token = access_token.get_secret_value()
+        if not token or len(token) > 256:
+            raise DeviceAuthenticationError("Device authentication failed.")
+        try:
+            with self._store.reserve_task_device(
+                device_id=expected_device_id,
+                token_digest=_sha256(token),
+            ) as device:
+                yield device
+        except DeviceNotFoundError as exc:
+            raise DeviceAuthenticationError("Device authentication failed.") from exc
+
+    def validate_reserved_task_device(
+        self,
+        access_token: SecretStr,
+        *,
+        expected_device_id: str,
+    ) -> Device:
+        """Revalidate the presented task-owner credential inside its reservation."""
+        if not isinstance(access_token, SecretStr):
+            raise DeviceAuthenticationError("Device authentication failed.")
+        token = access_token.get_secret_value()
+        if not token or len(token) > 256:
+            raise DeviceAuthenticationError("Device authentication failed.")
+        try:
+            return self._store.validate_reserved_task_device(
+                device_id=expected_device_id,
+                token_digest=_sha256(token),
+            )
+        except DeviceNotFoundError as exc:
+            raise DeviceAuthenticationError("Device authentication failed.") from exc
+
     def validate_reserved_approval_resume(
         self,
         access_token: SecretStr,

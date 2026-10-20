@@ -39,7 +39,7 @@ TASK_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
         {TaskState.READY, TaskState.CANCELLING, TaskState.CANCELLED}
     ),
     TaskState.WAITING_APPROVAL: frozenset(
-        {TaskState.RUNNING, TaskState.FAILED}
+        {TaskState.RUNNING, TaskState.FAILED, TaskState.CANCELLED}
     ),
     TaskState.CANCELLING: frozenset(
         {TaskState.CANCELLED, TaskState.RECONCILIATION_REQUIRED}
@@ -71,7 +71,7 @@ STEP_TRANSITIONS: dict[StepState, frozenset[StepState]] = {
     StepState.RETRY_WAIT: frozenset({StepState.READY, StepState.CANCELLED}),
     StepState.PAUSED: frozenset({StepState.READY, StepState.CANCELLED}),
     StepState.WAITING_APPROVAL: frozenset(
-        {StepState.RUNNING, StepState.FAILED}
+        {StepState.RUNNING, StepState.FAILED, StepState.CANCELLED}
     ),
     StepState.RECONCILIATION_REQUIRED: frozenset(
         {StepState.SUCCEEDED, StepState.READY, StepState.FAILED}

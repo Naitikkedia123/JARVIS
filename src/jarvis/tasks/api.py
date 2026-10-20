@@ -405,6 +405,34 @@ async def get_task_status(
         raise HTTPException(status_code=503, detail="Task status is unavailable.") from None
 
 
+@router.post("/{task_id}/cancel", response_model=TaskStatusResponse)
+async def cancel_task(
+    task_id: str,
+    authenticated: Annotated[tuple[SecretStr, Device], Depends(authenticated_device)],
+    store: Annotated[TaskStore, Depends(_task_store)],
+    runtime: Annotated[TaskRuntime, Depends(_task_runtime)],
+    response: Response,
+) -> TaskStatusResponse:
+    """Cancel an owned task only if no execution attempt has started."""
+    try:
+        runtime.cancel_owned_task(task_id, authenticated[0])
+        plan = store.get_task_plan_for_device(task_id, authenticated[1].id)
+        projected = _project_task_status(plan, store)
+    except EntityNotFoundError:
+        # Unknown and foreign task IDs intentionally have the same response.
+        raise HTTPException(status_code=404, detail="Task was not found.") from None
+    except TaskAuthorizationError:
+        raise HTTPException(status_code=404, detail="Task was not found.") from None
+    except InvalidTransitionError:
+        raise HTTPException(
+            status_code=409, detail="Task is unavailable for cancellation."
+        ) from None
+    except (TaskStoreError, sqlite3.Error, TypeError, ValueError):
+        raise HTTPException(status_code=503, detail="Task cancellation is unavailable.") from None
+    response.headers["Cache-Control"] = "no-store"
+    return projected
+
+
 @router.post("/approvals/{approval_id}/decision", response_model=ApprovalDecisionResponse)
 async def decide_approval(
     approval_id: UUID,
