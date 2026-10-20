@@ -16,7 +16,8 @@ from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
-from jarvis.tasks.authorization import TaskOwnership
+from jarvis.tasks.action import AuthorizedTaskAction
+from jarvis.tasks.authorization import TaskOwnership, TaskSubmissionProposal
 from jarvis.tasks.errors import (
     ActiveAttemptError,
     DependencyNotSatisfiedError,
@@ -28,6 +29,9 @@ from jarvis.tasks.errors import (
     TaskSubmissionConflictError,
 )
 from jarvis.tasks.models import (
+    AttemptAuthorization,
+    AttemptAuthorizationBinding,
+    AttemptDenial,
     AttemptOutcome,
     EventMetadata,
     Goal,
@@ -53,7 +57,7 @@ from jarvis.tasks.state import (
 )
 
 Clock = Callable[[], datetime]
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 6
 
 _SCHEMA_V1 = (
     """CREATE TABLE goals (
@@ -174,6 +178,25 @@ _SCHEMA_V3 = (
     "CREATE INDEX task_submissions_task_id_idx ON task_submissions(task_id)",
 )
 
+_SCHEMA_V4 = ("ALTER TABLE steps ADD COLUMN action_json TEXT",)
+
+_SCHEMA_V5 = (
+    """CREATE TABLE attempt_authorizations (
+        attempt_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        step_id TEXT NOT NULL,
+        action_digest TEXT NOT NULL CHECK(length(action_digest) = 64),
+        device_id TEXT NOT NULL CHECK(length(device_id) = 32),
+        authorization_fingerprint TEXT NOT NULL
+            CHECK(length(authorization_fingerprint) = 64),
+        FOREIGN KEY(attempt_id) REFERENCES step_attempts(id) ON DELETE CASCADE,
+        FOREIGN KEY(task_id, step_id) REFERENCES steps(task_id, id) ON DELETE CASCADE
+    )""",
+    "CREATE INDEX attempt_authorizations_task_id_idx ON attempt_authorizations(task_id)",
+)
+
+_SCHEMA_V6 = ("ALTER TABLE step_attempts ADD COLUMN dispatch_claimed_at TEXT",)
+
 
 def _json_dumps(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True)
@@ -270,6 +293,33 @@ class TaskStore:
                 self._connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (3, self._now()),
+                )
+            applied.add(3)
+        if 4 not in applied:
+            with self._transaction():
+                for statement in _SCHEMA_V4:
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (4, self._now()),
+                )
+            applied.add(4)
+        if 5 not in applied:
+            with self._transaction():
+                for statement in _SCHEMA_V5:
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (5, self._now()),
+                )
+            applied.add(5)
+        if 6 not in applied:
+            with self._transaction():
+                for statement in _SCHEMA_V6:
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (6, self._now()),
                 )
 
     def _now(self) -> str:
@@ -407,8 +457,8 @@ class TaskStore:
                 self._connection.execute(
                     """INSERT INTO steps
                         (id, task_id, title, state, replay_safety, idempotency_key,
-                         attempt_limit, attempt_count, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                         attempt_limit, attempt_count, created_at, updated_at, action_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         step.id,
                         task.id,
@@ -420,6 +470,9 @@ class TaskStore:
                         step.attempt_count,
                         _timestamp(step.created_at),
                         _timestamp(step.updated_at),
+                        None
+                        if step.action is None
+                        else _json_dumps(step.action.model_dump(mode="json")),
                     ),
                 )
                 self._append_event(
@@ -576,19 +629,23 @@ class TaskStore:
                 (step_id,),
             )
         ]
-        return Step(
-            id=row["id"],
-            task_id=row["task_id"],
-            title=row["title"],
-            dependencies=dependencies,
-            state=StepState(row["state"]),
-            replay_safety=ReplaySafety(row["replay_safety"]),
-            idempotency_key=row["idempotency_key"],
-            attempt_limit=row["attempt_limit"],
-            attempt_count=row["attempt_count"],
-            created_at=datetime.fromisoformat(row["created_at"]),
-            updated_at=datetime.fromisoformat(row["updated_at"]),
-        )
+        try:
+            return Step(
+                id=row["id"],
+                task_id=row["task_id"],
+                title=row["title"],
+                dependencies=dependencies,
+                state=StepState(row["state"]),
+                replay_safety=ReplaySafety(row["replay_safety"]),
+                idempotency_key=row["idempotency_key"],
+                attempt_limit=row["attempt_limit"],
+                attempt_count=row["attempt_count"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                updated_at=datetime.fromisoformat(row["updated_at"]),
+                action=self._action_from_json(row["action_json"]),
+            )
+        except (ValidationError, TypeError, ValueError) as exc:
+            raise TaskStoreError("Stored step is invalid.") from exc
 
     def list_steps(self, task_id: str) -> list[Step]:
         if self._connection.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
@@ -679,10 +736,46 @@ class TaskStore:
             )
         return self.get_step(step_id)
 
-    def start_step_attempt(self, step_id: str) -> StepAttempt:
+    def start_step_attempt(
+        self,
+        step_id: str,
+        *,
+        authorization: AttemptAuthorization | None = None,
+        denial: AttemptDenial | None = None,
+    ) -> StepAttempt:
         with self._transaction():
             row = self._step_context(step_id)
             step = self._step_from_context(row)
+            owner = self._connection.execute(
+                """SELECT task_submissions.device_id, task_submissions.idempotency_key,
+                    task_submissions.request_digest, goals.title, goals.description
+                    FROM task_submissions JOIN tasks ON tasks.id = task_submissions.task_id
+                    JOIN goals ON goals.id = tasks.goal_id WHERE task_submissions.task_id = ?""",
+                (row["task_id"],),
+            ).fetchone()
+            if owner is not None:
+                supplied = authorization or denial
+                persisted_digest = (
+                    TaskSubmissionProposal(
+                        idempotency_key=owner["idempotency_key"],
+                        title=owner["title"],
+                        description=owner["description"],
+                        action=step.action,
+                    ).request_digest()
+                    if step.action is not None
+                    else None
+                )
+                if (
+                    supplied is None
+                    or (authorization is not None and denial is not None)
+                    or step.action is None
+                    or supplied.device_id != owner["device_id"]
+                    or supplied.action_digest != step.action.digest()
+                    or persisted_digest != owner["request_digest"]
+                ):
+                    raise TaskStoreError("Owned task attempt authorization is invalid.")
+            elif authorization is not None or denial is not None:
+                raise TaskStoreError("Unowned tasks cannot use device authorization bindings.")
             if step.state is not StepState.READY:
                 raise InvalidTransitionError("Only ready steps can start an attempt.")
             if step.attempt_count >= step.attempt_limit:
@@ -722,6 +815,31 @@ class TaskStore:
                     now,
                 ),
             )
+            binding = None
+            if authorization is not None:
+                binding = AttemptAuthorizationBinding(
+                    task_id=row["task_id"],
+                    step_id=step_id,
+                    attempt_id=attempt.id,
+                    attempt_number=attempt_number,
+                    device_id=authorization.device_id,
+                    action_digest=authorization.action_digest,
+                    authorization_fingerprint=authorization.authorization_fingerprint,
+                )
+                self._connection.execute(
+                    """INSERT INTO attempt_authorizations
+                        (attempt_id, task_id, step_id, action_digest, device_id,
+                         authorization_fingerprint) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        binding.attempt_id,
+                        binding.task_id,
+                        binding.step_id,
+                        binding.action_digest,
+                        binding.device_id,
+                        binding.authorization_fingerprint,
+                    ),
+                )
+            event_authorization = authorization or denial
             self._connection.execute(
                 "UPDATE steps SET state = ?, attempt_count = ?, updated_at = ? WHERE id = ?",
                 (StepState.RUNNING.value, attempt_number, now, step_id),
@@ -736,9 +854,25 @@ class TaskStore:
                 metadata=EventMetadata(
                     attempt_number=attempt_number,
                     replay_safety=step.replay_safety,
+                    attempt_id=attempt.id,
+                    action_digest=(
+                        None
+                        if event_authorization is None
+                        else event_authorization.action_digest
+                    ),
+                    device_id=(
+                        None
+                        if event_authorization is None
+                        else event_authorization.device_id
+                    ),
+                    authorization_fingerprint=(
+                        None
+                        if event_authorization is None
+                        else event_authorization.authorization_fingerprint
+                    ),
                 ),
             )
-        return attempt
+        return attempt.model_copy(update={"authorization_binding": binding})
 
     def finish_step_attempt(
         self,
@@ -759,8 +893,13 @@ class TaskStore:
             if step.state is not StepState.RUNNING:
                 raise ActiveAttemptError("Step has no running attempt.")
             active = self._connection.execute(
-                """SELECT id, attempt_number FROM step_attempts
-                    WHERE step_id = ? AND outcome = 'running'""",
+                """SELECT step_attempts.id, step_attempts.attempt_number,
+                    attempt_authorizations.action_digest,
+                    attempt_authorizations.device_id,
+                    attempt_authorizations.authorization_fingerprint
+                    FROM step_attempts LEFT JOIN attempt_authorizations
+                        ON attempt_authorizations.attempt_id = step_attempts.id
+                    WHERE step_attempts.step_id = ? AND step_attempts.outcome = 'running'""",
                 (step_id,),
             ).fetchone()
             if active is None:
@@ -818,11 +957,79 @@ class TaskStore:
                     replay_safety=step.replay_safety,
                     outcome=outcome,
                     error_code=error_code,
+                    attempt_id=active["id"],
+                    action_digest=active["action_digest"],
+                    device_id=active["device_id"],
+                    authorization_fingerprint=active["authorization_fingerprint"],
                 ),
             )
             if target is StepState.SUCCEEDED:
                 self._insert_checkpoint(row["task_id"], step_id)
         return self.get_step(step_id)
+
+    def claim_dispatch(self, binding: AttemptAuthorizationBinding) -> None:
+        """Atomically consume a single dispatch right for one bound attempt."""
+        with self._transaction():
+            row = self._connection.execute(
+                """SELECT step_attempts.outcome, step_attempts.dispatch_claimed_at,
+                    steps.state AS step_state, steps.action_json, steps.task_id,
+                    attempt_authorizations.task_id AS binding_task_id,
+                    attempt_authorizations.step_id AS binding_step_id,
+                    attempt_authorizations.action_digest,
+                    attempt_authorizations.device_id,
+                    attempt_authorizations.authorization_fingerprint
+                    FROM step_attempts
+                    JOIN steps ON steps.id = step_attempts.step_id
+                    LEFT JOIN attempt_authorizations
+                        ON attempt_authorizations.attempt_id = step_attempts.id
+                    WHERE step_attempts.id = ? AND step_attempts.step_id = ?
+                        AND step_attempts.attempt_number = ?""",
+                (binding.attempt_id, binding.step_id, binding.attempt_number),
+            ).fetchone()
+            if row is None:
+                raise ActiveAttemptError("Attempt is unavailable for dispatch.")
+            action = self._action_from_json(row["action_json"])
+            owner = self._connection.execute(
+                """SELECT task_submissions.device_id, task_submissions.idempotency_key,
+                    task_submissions.request_digest, goals.title, goals.description
+                    FROM task_submissions JOIN tasks ON tasks.id = task_submissions.task_id
+                    JOIN goals ON goals.id = tasks.goal_id WHERE task_submissions.task_id = ?""",
+                (row["task_id"],),
+            ).fetchone()
+            persisted_digest = (
+                TaskSubmissionProposal(
+                    idempotency_key=owner["idempotency_key"],
+                    title=owner["title"],
+                    description=owner["description"],
+                    action=action,
+                ).request_digest()
+                if owner is not None and action is not None
+                else None
+            )
+            if (
+                row["outcome"] != AttemptOutcome.RUNNING.value
+                or row["step_state"] != StepState.RUNNING.value
+                or row["dispatch_claimed_at"] is not None
+                or row["binding_task_id"] != binding.task_id
+                or row["binding_step_id"] != binding.step_id
+                or row["action_digest"] != binding.action_digest
+                or row["device_id"] != binding.device_id
+                or row["authorization_fingerprint"] != binding.authorization_fingerprint
+                or row["task_id"] != binding.task_id
+                or action is None
+                or action.digest() != binding.action_digest
+                or owner is None
+                or owner["device_id"] != binding.device_id
+                or persisted_digest != owner["request_digest"]
+            ):
+                raise ActiveAttemptError("Attempt is unavailable for dispatch.")
+            cursor = self._connection.execute(
+                "UPDATE step_attempts SET dispatch_claimed_at = ? "
+                "WHERE id = ? AND dispatch_claimed_at IS NULL AND outcome = 'running'",
+                (self._now(), binding.attempt_id),
+            )
+            if cursor.rowcount != 1:
+                raise ActiveAttemptError("Attempt is unavailable for dispatch.")
 
     def reconcile_step(
         self,
@@ -883,8 +1090,13 @@ class TaskStore:
             if step.state is not StepState.RUNNING:
                 raise ActiveAttemptError("Step has no interrupted running attempt.")
             active = self._connection.execute(
-                "SELECT id, attempt_number FROM step_attempts "
-                "WHERE step_id = ? AND outcome = 'running'",
+                """SELECT step_attempts.id, step_attempts.attempt_number,
+                    attempt_authorizations.action_digest,
+                    attempt_authorizations.device_id,
+                    attempt_authorizations.authorization_fingerprint
+                    FROM step_attempts LEFT JOIN attempt_authorizations
+                        ON attempt_authorizations.attempt_id = step_attempts.id
+                    WHERE step_attempts.step_id = ? AND step_attempts.outcome = 'running'""",
                 (step_id,),
             ).fetchone()
             if active is None:
@@ -931,6 +1143,10 @@ class TaskStore:
                     replay_safety=step.replay_safety,
                     outcome=AttemptOutcome.OUTCOME_UNKNOWN,
                     error_code=SafeErrorCode.OUTCOME_UNKNOWN,
+                    attempt_id=active["id"],
+                    action_digest=active["action_digest"],
+                    device_id=active["device_id"],
+                    authorization_fingerprint=active["authorization_fingerprint"],
                 ),
             )
         return self.get_step(step_id)
@@ -947,18 +1163,31 @@ class TaskStore:
 
     @staticmethod
     def _step_from_context(row: sqlite3.Row) -> Step:
-        return Step(
-            id=row["id"],
-            task_id=row["task_id"],
-            title=row["title"],
-            state=StepState(row["state"]),
-            replay_safety=ReplaySafety(row["replay_safety"]),
-            idempotency_key=row["idempotency_key"],
-            attempt_limit=row["attempt_limit"],
-            attempt_count=row["attempt_count"],
-            created_at=datetime.fromisoformat(row["created_at"]),
-            updated_at=datetime.fromisoformat(row["updated_at"]),
-        )
+        try:
+            return Step(
+                id=row["id"],
+                task_id=row["task_id"],
+                title=row["title"],
+                state=StepState(row["state"]),
+                replay_safety=ReplaySafety(row["replay_safety"]),
+                idempotency_key=row["idempotency_key"],
+                attempt_limit=row["attempt_limit"],
+                attempt_count=row["attempt_count"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                updated_at=datetime.fromisoformat(row["updated_at"]),
+                action=TaskStore._action_from_json(row["action_json"]),
+            )
+        except (ValidationError, TypeError, ValueError) as exc:
+            raise TaskStoreError("Stored step is invalid.") from exc
+
+    @staticmethod
+    def _action_from_json(value: str | None) -> AuthorizedTaskAction | None:
+        if value is None:
+            return None
+        try:
+            return AuthorizedTaskAction.model_validate_json(value)
+        except (ValidationError, TypeError, ValueError) as exc:
+            raise TaskStoreError("Stored step action is invalid.") from exc
 
     def _insert_checkpoint(self, task_id: str, step_id: str) -> None:
         sequence_row = self._connection.execute(
@@ -1014,7 +1243,15 @@ class TaskStore:
 
     def list_attempts(self, step_id: str) -> list[StepAttempt]:
         rows = self._connection.execute(
-            "SELECT * FROM step_attempts WHERE step_id = ? ORDER BY attempt_number", (step_id,)
+            """SELECT step_attempts.*, attempt_authorizations.task_id AS binding_task_id,
+                attempt_authorizations.step_id AS binding_step_id,
+                attempt_authorizations.action_digest AS binding_action_digest,
+                attempt_authorizations.device_id AS binding_device_id,
+                attempt_authorizations.authorization_fingerprint AS binding_fingerprint
+                FROM step_attempts LEFT JOIN attempt_authorizations
+                    ON attempt_authorizations.attempt_id = step_attempts.id
+                WHERE step_attempts.step_id = ? ORDER BY step_attempts.attempt_number""",
+            (step_id,),
         )
         return [
             StepAttempt(
@@ -1024,10 +1261,28 @@ class TaskStore:
                 outcome=AttemptOutcome(row["outcome"]),
                 replay_safety=ReplaySafety(row["replay_safety"]),
                 idempotency_key=row["idempotency_key"],
+                authorization_binding=(
+                    None
+                    if row["binding_task_id"] is None
+                    else AttemptAuthorizationBinding(
+                        task_id=row["binding_task_id"],
+                        step_id=row["binding_step_id"],
+                        attempt_id=row["id"],
+                        attempt_number=row["attempt_number"],
+                        device_id=row["binding_device_id"],
+                        action_digest=row["binding_action_digest"],
+                        authorization_fingerprint=row["binding_fingerprint"],
+                    )
+                ),
                 error_code=SafeErrorCode(row["error_code"]) if row["error_code"] else None,
                 started_at=datetime.fromisoformat(row["started_at"]),
                 finished_at=(
                     datetime.fromisoformat(row["finished_at"]) if row["finished_at"] else None
+                ),
+                dispatch_claimed_at=(
+                    datetime.fromisoformat(row["dispatch_claimed_at"])
+                    if row["dispatch_claimed_at"]
+                    else None
                 ),
             )
             for row in rows

@@ -6,6 +6,7 @@ from hashlib import sha256
 from typing import Protocol
 from uuid import UUID, uuid5
 
+from jarvis.tasks.action import AuthorizedTaskAction
 from jarvis.tasks.models import Goal, ReplaySafety, Step, Task, TaskPlan
 
 _TASK_NAMESPACE = UUID("d9708cd4-b158-4d0f-9f0d-f5f38ec63f06")
@@ -17,7 +18,9 @@ class Planner(Protocol):
     @property
     def version(self) -> str: ...
 
-    def plan(self, goal: Goal) -> TaskPlan: ...
+    def plan(
+        self, goal: Goal, *, action: AuthorizedTaskAction | None = None
+    ) -> TaskPlan: ...
 
 
 class DeterministicPlanner:
@@ -25,7 +28,9 @@ class DeterministicPlanner:
 
     version = "deterministic-v1"
 
-    def plan(self, goal: Goal) -> TaskPlan:
+    def plan(
+        self, goal: Goal, *, action: AuthorizedTaskAction | None = None
+    ) -> TaskPlan:
         task_id = uuid5(_TASK_NAMESPACE, f"task:{goal.id}").hex
         step_id = uuid5(_TASK_NAMESPACE, f"step:{goal.id}").hex
         suffix = sha256(goal.title.encode("utf-8")).hexdigest()[:8]
@@ -41,7 +46,12 @@ class DeterministicPlanner:
             id=step_id,
             task_id=task_id,
             title=f"Complete goal {suffix}",
-            replay_safety=ReplaySafety.PURE,
+            action=action,
+            replay_safety=(
+                ReplaySafety.NON_IDEMPOTENT
+                if action is not None
+                else ReplaySafety.PURE
+            ),
             created_at=goal.created_at,
             updated_at=goal.created_at,
         )

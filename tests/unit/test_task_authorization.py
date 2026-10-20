@@ -8,10 +8,12 @@ from datetime import UTC, datetime, timedelta
 from threading import Barrier
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, SecretStr, ValidationError
 
 from jarvis.devices.models import Device, DevicePlatform, DeviceRole
+from jarvis.tasks.action import AuthorizedTaskAction
 from jarvis.tasks.authorization import (
+    DispatchAuthorization,
     TaskSubmissionPolicyDecision,
     TaskSubmissionProposal,
     resolve_task_authorization,
@@ -24,10 +26,10 @@ from jarvis.tasks.errors import (
 )
 from jarvis.tasks.models import Step, StepResult
 from jarvis.tasks.planner import DeterministicPlanner
-from jarvis.tasks.runtime import StepExecutionFailure, TaskRuntime
+from jarvis.tasks.runtime import TaskRuntime
 from jarvis.tasks.store import TaskStore
 from jarvis.tools.dispatcher import InMemoryToolAuditSink, ToolDispatcher
-from jarvis.tools.errors import ApprovalRequestStoreError, AuthorizationDeniedError
+from jarvis.tools.errors import ApprovalRequestStoreError
 from jarvis.tools.models import AuthorizationContext, ToolAccess, ToolDefinition, ToolRequest
 from jarvis.tools.policy import ToolPolicy
 from jarvis.tools.registry import ToolRegistry
@@ -60,6 +62,7 @@ def proposal(
         idempotency_key=key,
         title=title,
         description=description,
+        action=AuthorizedTaskAction(tool_name="jarvis.status", arguments={}),
     )
 
 
@@ -122,11 +125,55 @@ class AuthorizedRunner:
         return StepResult(data={"authorized": True})
 
 
-def runtime_for(tmp_path, runner=None) -> tuple[TaskStore, TaskRuntime, object]:
+def runtime_for(
+    tmp_path, runner=None, *, authorized_runner=None
+) -> tuple[TaskStore, TaskRuntime, object]:
     store = TaskStore(tmp_path / "task-authorization.sqlite3")
     actual_runner = runner or AuthorizedRunner()
-    runtime = TaskRuntime(store, DeterministicPlanner(), actual_runner)
+    runtime = TaskRuntime(
+        store,
+        DeterministicPlanner(),
+        actual_runner,
+        authorized_runner=authorized_runner,
+    )
     return store, runtime, actual_runner
+
+
+class AsyncAuthorizationRunner:
+    """Small token-checking harness for the runtime's async authorization boundary."""
+
+    def __init__(self, store: TaskStore, device_id: str, token: str) -> None:
+        self.store = store
+        self.device_id = device_id
+        self.token = token
+        self.authorizations: list[DispatchAuthorization] = []
+        self.executions = 0
+
+    def authorize(self, task_id, step, access_token) -> DispatchAuthorization:
+        if (
+            not isinstance(access_token, SecretStr)
+            or access_token.get_secret_value() != self.token
+            or step.action is None
+        ):
+            raise TaskAuthorizationError("Task execution is not authorized.")
+        authorization = DispatchAuthorization(
+            device_id=self.device_id,
+            action_digest=step.action.digest(),
+            decision_id="unit-test-grant",
+            fingerprint="f" * 64,
+            tool_authorization=AuthorizationContext(
+                principal_id=self.device_id,
+                granted_capabilities=frozenset({"system:status:read"}),
+            ),
+        )
+        self.authorizations.append(authorization)
+        return authorization
+
+    async def execute_claimed(self, task_id, step, access_token, binding) -> StepResult:
+        assert access_token.get_secret_value() == self.token
+        self.store.claim_dispatch(binding)
+        self.executions += 1
+        return StepResult(data={"state": "responding"})
 
 
 def test_policy_decision_is_required_and_device_metadata_never_grants() -> None:
@@ -247,8 +294,8 @@ def test_concurrent_same_device_submissions_create_one_task(tmp_path) -> None:
     class SynchronizedPlanner:
         version = DeterministicPlanner.version
 
-        def plan(self, goal):
-            plan = DeterministicPlanner().plan(goal)
+        def plan(self, goal, *, action=None):
+            plan = DeterministicPlanner().plan(goal, action=action)
             planner_barrier.wait(timeout=5)
             return plan
 
@@ -309,9 +356,17 @@ def test_failed_ownership_persistence_rolls_back_goal_plan_and_events(tmp_path) 
     store.close()
 
 
-def test_device_owned_task_requires_reauthorization_and_authorized_runner(tmp_path) -> None:
-    store, runtime, runner = runtime_for(tmp_path)
+def test_device_owned_task_requires_fresh_async_authorization(tmp_path) -> None:
     paired = device()
+    token = "test-owner-access-token"
+    store = TaskStore(tmp_path / "task-authorization.sqlite3")
+    runner = AsyncAuthorizationRunner(store, paired.id, token)
+    runtime = TaskRuntime(
+        store,
+        DeterministicPlanner(),
+        AuthorizedRunner(),
+        authorized_runner=runner,
+    )
     submission = runtime.submit_device_task(paired, proposal(), policy=AllowPolicy())
     task_id = submission.plan.task.id
 
@@ -326,19 +381,20 @@ def test_device_owned_task_requires_reauthorization_and_authorized_runner(tmp_pa
             device("f" * 32),
             policy=AllowPolicy(),
         )
-    assert runner.authorized_calls == []
-    assert runner.legacy_calls == []
+    assert runner.authorizations == []
     assert store.get_task(task_id).state == "ready"
 
     with pytest.raises(TaskAuthorizationError):
-        runtime.run_authorized_task(task_id, paired, policy=DenyPolicy())
-    assert runner.authorized_calls == []
+        asyncio.run(runtime.run_authorized_task_async(task_id, SecretStr("wrong-token")))
+    assert runner.executions == 0
+    assert store.list_attempts(submission.plan.steps[0].id) == []
 
-    completed = runtime.run_authorized_task(task_id, paired, policy=AllowPolicy())
+    completed = asyncio.run(
+        runtime.run_authorized_task_async(task_id, SecretStr(token))
+    )
     assert completed.state == "completed"
-    assert len(runner.authorized_calls) == 1
-    assert runner.authorized_calls[0][1].tool_authorization.principal_id == paired.id
-    assert runner.legacy_calls == []
+    assert runner.executions == 1
+    assert runner.authorizations[0].device_id == paired.id
     store.close()
 
 
@@ -409,7 +465,9 @@ def test_authorized_device_task_fails_before_attempt_without_authorized_runner(t
     plan = runtime.submit_device_task(paired, proposal(), policy=AllowPolicy()).plan
 
     with pytest.raises(TaskAuthorizationError):
-        runtime.run_authorized_task(plan.task.id, paired, policy=AllowPolicy())
+        asyncio.run(
+            runtime.run_authorized_task_async(plan.task.id, SecretStr("test-token"))
+        )
 
     assert legacy_runner.calls == 0
     assert store.get_task(plan.task.id).state == "ready"
@@ -438,76 +496,30 @@ def test_revoked_device_and_invalid_proposal_fail_closed(tmp_path) -> None:
     store.close()
 
 
-def test_authorized_runner_carries_policy_context_to_tool_dispatcher(tmp_path) -> None:
-    class Input(BaseModel):
-        value: str
+def test_async_execution_persists_action_bound_authorization(tmp_path) -> None:
+    paired = device()
+    token = "action-bound-access-token"
+    store = TaskStore(tmp_path / "task-authorization.sqlite3")
+    runner = AsyncAuthorizationRunner(store, paired.id, token)
+    runtime = TaskRuntime(
+        store,
+        DeterministicPlanner(),
+        authorized_runner=runner,
+    )
+    submission = runtime.submit_device_task(paired, proposal(), policy=AllowPolicy())
 
-    class Output(BaseModel):
-        accepted: bool
+    result = asyncio.run(
+        runtime.run_authorized_task_async(
+            submission.plan.task.id,
+            SecretStr(token),
+        )
+    )
 
-    class Executor:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def execute(self, arguments: BaseModel) -> object:
-            del arguments
-            self.calls += 1
-            return {"accepted": True}
-
-    class DispatcherRunner(AuthorizedRunner):
-        def __init__(self) -> None:
-            super().__init__()
-            definition = ToolDefinition(
-                name="workspace.create",
-                description="Create a workspace file.",
-                input_schema=Input,
-                output_schema=Output,
-                required_capabilities=frozenset({"workspace:write"}),
-                access=ToolAccess.WRITE,
-            )
-            registry = ToolRegistry()
-            registry.register(definition)
-            self.executor = Executor()
-            self.audit = InMemoryToolAuditSink()
-            self.dispatcher = ToolDispatcher(
-                registry,
-                ToolPolicy(),
-                {definition.name: self.executor},
-                self.audit,
-            )
-
-        def execute_authorized(
-            self,
-            step: Step,
-            *,
-            idempotency_key: str | None,
-            authorization,
-            memory_context,
-        ) -> StepResult:
-            del idempotency_key, memory_context
-            try:
-                asyncio.run(
-                    self.dispatcher.dispatch(
-                        ToolRequest(
-                            tool_name="workspace.create",
-                            arguments={"value": step.title},
-                        ),
-                        authorization_context=authorization.tool_authorization,
-                    )
-                )
-            except AuthorizationDeniedError as exc:
-                raise StepExecutionFailure(retryable=False) from exc
-            return StepResult(data={"dispatched": True})
-
-    dispatch_runner = DispatcherRunner()
-    store, runtime, _runner = runtime_for(tmp_path, dispatch_runner)
-    paired = device(reported_capabilities=frozenset({"workspace:write", "tool:write"}))
-    task = runtime.submit_device_task(paired, proposal(), policy=AllowPolicy()).plan.task
-
-    result = runtime.run_authorized_task(task.id, paired, policy=AllowPolicy())
-
-    assert result.state == "failed"
-    assert dispatch_runner.executor.calls == 0
-    assert dispatch_runner.audit.events[-1].reason_code == "missing_capabilities"
-    assert dispatch_runner.authorized_calls == []
+    attempt = store.list_attempts(submission.plan.steps[0].id)[0]
+    assert result.state == "completed"
+    assert runner.executions == 1
+    assert attempt.authorization_binding is not None
+    assert attempt.authorization_binding.device_id == paired.id
+    assert attempt.authorization_binding.action_digest == submission.plan.steps[0].action.digest()
+    assert attempt.authorization_binding.authorization_fingerprint == "f" * 64
     store.close()

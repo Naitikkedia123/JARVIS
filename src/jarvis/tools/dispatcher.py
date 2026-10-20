@@ -31,6 +31,7 @@ from jarvis.tools.models import (
     ToolAuditEvent,
     ToolAuditOutcome,
     ToolDefinition,
+    ToolExecutionCorrelation,
     ToolRequest,
 )
 from jarvis.tools.policy import ToolPolicy
@@ -83,17 +84,26 @@ class ToolDispatcher:
         self._approval_service = approval_service
         self._registry.seal()
 
+    def require_policy(self, policy_type: type[ToolPolicy]) -> None:
+        """Fail closed when a security-sensitive runner has the wrong policy."""
+        if type(self._policy) is not policy_type:
+            raise ValueError("Dispatcher policy does not satisfy the required boundary.")
+        validate_registry = getattr(self._policy, "validate_registry", None)
+        if callable(validate_registry):
+            validate_registry(self._registry)
+
     async def dispatch(
         self,
         request: ToolRequest,
         *,
         authorization_context: AuthorizationContext | None = None,
+        correlation: ToolExecutionCorrelation | None = None,
     ) -> ToolExecutionResult:
         definition = self._registry.get(request.tool_name)
         decision = self._policy.authorize(definition, authorization_context)
         if authorization_context is None or not decision.allowed:
             reason = "missing_context" if authorization_context is None else decision.reason
-            self._record_denial(definition, authorization_context, reason)
+            self._record_denial(definition, authorization_context, reason, correlation)
             raise AuthorizationDeniedError()
 
         self._record(
@@ -102,6 +112,7 @@ class ToolDispatcher:
                 authorization_context,
                 ToolAuditOutcome.AUTHORIZATION_GRANTED,
                 "granted",
+                correlation=correlation,
             )
         )
 
@@ -114,12 +125,13 @@ class ToolDispatcher:
                     authorization_context,
                     ToolAuditOutcome.VALIDATION_FAILED,
                     "input_validation_failed",
+                    correlation=correlation,
                 )
             )
             raise
 
         if definition.requires_approval:
-            self._request_approval(definition, authorization_context)
+            self._request_approval(definition, authorization_context, correlation)
 
         executor = self._executors.get(definition.name)
         if executor is None:
@@ -129,9 +141,10 @@ class ToolDispatcher:
                     authorization_context,
                     ToolAuditOutcome.EXECUTION_FAILED,
                     "executor_unavailable",
+                    correlation=correlation,
                 )
             )
-            raise ToolExecutionError() from None
+            raise ToolExecutionError(executor_invoked=False) from None
 
         self._record(
             self._event(
@@ -139,6 +152,7 @@ class ToolDispatcher:
                 authorization_context,
                 ToolAuditOutcome.EXECUTION_STARTED,
                 "execution_started",
+                correlation=correlation,
             )
         )
         started = time.monotonic()
@@ -156,7 +170,9 @@ class ToolDispatcher:
                     ToolAuditOutcome.EXECUTION_TIMED_OUT,
                     "timeout",
                     started=started,
-                )
+                    correlation=correlation,
+                ),
+                executor_invoked=True,
             )
             raise ToolTimeoutError() from None
         except Exception:
@@ -167,9 +183,11 @@ class ToolDispatcher:
                     ToolAuditOutcome.EXECUTION_FAILED,
                     "executor_error",
                     started=started,
-                )
+                    correlation=correlation,
+                ),
+                executor_invoked=True,
             )
-            raise ToolExecutionError() from None
+            raise ToolExecutionError(executor_invoked=True) from None
 
         try:
             output = definition.output_schema.model_validate(raw_output)
@@ -188,7 +206,9 @@ class ToolDispatcher:
                     ToolAuditOutcome.VALIDATION_FAILED,
                     "output_validation_failed",
                     started=started,
-                )
+                    correlation=correlation,
+                ),
+                executor_invoked=True,
             )
             raise ToolOutputValidationError() from None
         if len(serialized.encode("utf-8")) > definition.max_result_bytes:
@@ -199,7 +219,9 @@ class ToolDispatcher:
                     ToolAuditOutcome.VALIDATION_FAILED,
                     "result_size_exceeded",
                     started=started,
-                )
+                    correlation=correlation,
+                ),
+                executor_invoked=True,
             )
             raise ToolResultTooLargeError()
 
@@ -210,7 +232,9 @@ class ToolDispatcher:
                 ToolAuditOutcome.EXECUTION_SUCCEEDED,
                 "success",
                 started=started,
-            )
+                correlation=correlation,
+            ),
+            executor_invoked=True,
         )
         return ToolExecutionResult(
             tool_name=definition.name,
@@ -222,6 +246,7 @@ class ToolDispatcher:
         self,
         definition: ToolDefinition,
         authorization_context: AuthorizationContext,
+        correlation: ToolExecutionCorrelation | None,
     ) -> None:
         service = self._approval_service
         summary = definition.approval_summary
@@ -232,6 +257,7 @@ class ToolDispatcher:
                     authorization_context,
                     ToolAuditOutcome.APPROVAL_FAILED,
                     "approval_service_unavailable",
+                    correlation=correlation,
                 )
             )
             raise ApprovalRequestStoreError() from None
@@ -257,6 +283,7 @@ class ToolDispatcher:
                     authorization_context,
                     ToolAuditOutcome.APPROVAL_FAILED,
                     "approval_storage_failed",
+                    correlation=correlation,
                 )
             )
             raise ApprovalRequestStoreError() from None
@@ -267,6 +294,7 @@ class ToolDispatcher:
                 authorization_context,
                 ToolAuditOutcome.APPROVAL_REQUESTED,
                 "approval_requested",
+                correlation=correlation,
             )
         )
         raise ToolApprovalRequiredError(request)
@@ -276,6 +304,7 @@ class ToolDispatcher:
         definition: ToolDefinition,
         context: AuthorizationContext | None,
         reason: str,
+        correlation: ToolExecutionCorrelation | None,
     ) -> None:
         try:
             self._record(
@@ -284,19 +313,20 @@ class ToolDispatcher:
                     context,
                     ToolAuditOutcome.AUTHORIZATION_DENIED,
                     reason,
+                    correlation=correlation,
                 )
             )
         except ToolAuditError:
             # Preserve the denial even when the sink is unavailable; never continue dispatch.
             pass
 
-    def _record(self, event: ToolAuditEvent) -> None:
+    def _record(self, event: ToolAuditEvent, *, executor_invoked: bool = False) -> None:
         try:
             self._audit_sink.record(event)
         except Exception:
             # Pre-execution audit failures fail closed. Post-execution failures surface
             # as this same typed error so callers know the outcome could not be recorded.
-            raise ToolAuditError() from None
+            raise ToolAuditError(executor_invoked=executor_invoked) from None
 
     @staticmethod
     def _event(
@@ -306,6 +336,7 @@ class ToolDispatcher:
         reason_code: str,
         *,
         started: float | None = None,
+        correlation: ToolExecutionCorrelation | None = None,
     ) -> ToolAuditEvent:
         duration_ms = None if started is None else max(0, round((time.monotonic() - started) * 1000))
         return ToolAuditEvent(
@@ -315,6 +346,7 @@ class ToolDispatcher:
             outcome=outcome,
             reason_code=reason_code,
             duration_ms=duration_ms,
+            correlation=correlation,
         )
 
     @staticmethod

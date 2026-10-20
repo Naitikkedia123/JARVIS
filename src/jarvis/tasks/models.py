@@ -11,6 +11,9 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from jarvis.devices.models import DeviceId
+from jarvis.tasks.action import AuthorizedTaskAction
+
 OpaqueId = Annotated[str, Field(min_length=1, max_length=128)]
 
 
@@ -91,6 +94,41 @@ class EventMetadata(BaseModel):
     outcome: AttemptOutcome | ReconciliationOutcome | None = None
     error_code: SafeErrorCode | None = None
     confirmation_id: UUID | None = None
+    attempt_id: OpaqueId | None = None
+    action_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    device_id: DeviceId | None = None
+    authorization_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class AttemptAuthorization(BaseModel):
+    """Authorization facts supplied to the store before an owned dispatch claim."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    device_id: DeviceId
+    action_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    authorization_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class AttemptDenial(BaseModel):
+    """Authenticated, pre-dispatch denial recorded without creating a grant."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    device_id: DeviceId
+    action_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    authorization_fingerprint: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+
+
+class AttemptAuthorizationBinding(AttemptAuthorization):
+    """Durable per-attempt binding; generated transactionally by TaskStore."""
+
+    task_id: OpaqueId
+    step_id: OpaqueId
+    attempt_id: OpaqueId
+    attempt_number: int = Field(ge=1, le=10)
 
 
 def _utc_now() -> datetime:
@@ -140,6 +178,7 @@ class Step(DomainModel):
     id: OpaqueId = Field(default_factory=lambda: uuid4().hex)
     task_id: OpaqueId
     title: str = Field(min_length=1, max_length=200)
+    action: AuthorizedTaskAction | None = None
     dependencies: list[OpaqueId] = Field(default_factory=list, max_length=100)
     state: StepState = StepState.PENDING
     replay_safety: ReplaySafety = ReplaySafety.NON_IDEMPOTENT
@@ -220,11 +259,13 @@ class StepAttempt(DomainModel):
     outcome: AttemptOutcome = AttemptOutcome.RUNNING
     replay_safety: ReplaySafety
     idempotency_key: OpaqueId | None = None
+    authorization_binding: AttemptAuthorizationBinding | None = None
+    dispatch_claimed_at: datetime | None = None
     error_code: SafeErrorCode | None = None
     started_at: datetime
     finished_at: datetime | None = None
 
-    @field_validator("started_at", "finished_at")
+    @field_validator("started_at", "finished_at", "dispatch_claimed_at")
     @classmethod
     def timestamps_are_aware_utc(cls, value: datetime | None) -> datetime | None:
         return None if value is None else _require_aware_utc(value)

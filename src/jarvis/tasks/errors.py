@@ -21,8 +21,32 @@ class TaskStoreError(TaskError):
     """Raised for safe, normalized persistence errors."""
 
 
+class TaskRunnerUnavailableError(TaskError):
+    """Legacy task execution is unavailable because no legacy runner is configured."""
+
+
 class TaskAuthorizationError(TaskError):
     """A device task lacks a valid explicit policy authorization decision."""
+
+
+class TaskSubmissionPolicyUnavailableError(TaskError):
+    """The local submission policy could not be read or validated safely."""
+
+
+class TaskDispatchDeniedError(TaskAuthorizationError):
+    """An authenticated owner was denied by the current dispatch policy."""
+
+    def __init__(
+        self,
+        *,
+        device_id: str,
+        action_digest: str,
+        authorization_fingerprint: str | None = None,
+    ) -> None:
+        self.device_id = device_id
+        self.action_digest = action_digest
+        self.authorization_fingerprint = authorization_fingerprint
+        super().__init__("Task execution is not authorized.")
 
 
 class TaskSubmissionConflictError(TaskError):

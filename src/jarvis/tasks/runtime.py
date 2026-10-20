@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from threading import Lock
 from typing import Protocol
 from uuid import UUID, uuid5
+
+from pydantic import SecretStr
 
 from jarvis.devices.models import Device
 from jarvis.memory.context import MemoryContextAssembler, TaskMemoryContext
@@ -22,9 +25,13 @@ from jarvis.tasks.authorization import (
 from jarvis.tasks.errors import (
     InvalidTransitionError,
     TaskAuthorizationError,
+    TaskDispatchDeniedError,
     TaskError,
+    TaskRunnerUnavailableError,
 )
 from jarvis.tasks.models import (
+    AttemptAuthorization,
+    AttemptDenial,
     AttemptOutcome,
     Goal,
     GoalState,
@@ -38,7 +45,17 @@ from jarvis.tasks.models import (
     TaskState,
 )
 from jarvis.tasks.planner import Planner
+from jarvis.tasks.runner import DispatcherBackedTaskRunner
 from jarvis.tasks.store import TaskStore
+from jarvis.tools.errors import (
+    AuthorizationDeniedError,
+    ToolAuditError,
+    ToolExecutionError,
+    ToolInputValidationError,
+    ToolOutputValidationError,
+    ToolResultTooLargeError,
+    ToolTimeoutError,
+)
 
 
 class StepRunner(Protocol):
@@ -114,14 +131,16 @@ class TaskRuntime:
         self,
         store: TaskStore,
         planner: Planner,
-        runner: StepRunner,
+        runner: StepRunner | None = None,
         *,
         memory_context_assembler: MemoryContextAssembler | None = None,
+        authorized_runner: DispatcherBackedTaskRunner | None = None,
     ) -> None:
         self.store = store
         self.planner = planner
         self.runner = runner
         self.memory_context_assembler = memory_context_assembler
+        self.authorized_runner = authorized_runner
         self._database_key = str(Path(store.db_path).resolve())
 
     def create_task(self, goal_id: str) -> TaskPlan:
@@ -162,7 +181,10 @@ class TaskRuntime:
             title=proposal.title,
             description=proposal.description,
         )
-        plan = self.planner.plan(goal)
+        plan = self.planner.plan(goal, action=proposal.action)
+        planned_actions = [step.action for step in plan.steps if step.action is not None]
+        if len(planned_actions) != 1 or planned_actions[0] != proposal.action:
+            raise TaskAuthorizationError("Task submission is not authorized.")
         if plan.task.planner_version != self.planner.version:
             plan.task.planner_version = self.planner.version
         persisted_plan, created = self.store.add_device_task_submission(
@@ -238,27 +260,183 @@ class TaskRuntime:
         policy: TaskSubmissionPolicy | None,
         memory_access: RetrievalContext | None = None,
     ) -> Task:
-        """Re-authorize the owning device before execution and dispatch handoff."""
+        """Reject the legacy object-based path; current credentials are required."""
+        del task_id, device, policy, memory_access
+        raise TaskAuthorizationError(
+            "Use the token-authenticated asynchronous task execution boundary."
+        )
+
+    async def run_authorized_task_async(
+        self, task_id: str, access_token: SecretStr
+    ) -> Task:
+        """Run one owned typed action after fresh authentication and policy checks.
+
+        This is deliberately separate from the synchronous legacy task path. SQLite
+        access stays on the connection's creating thread; dispatcher execution is
+        awaited and never bridged with ``asyncio.run``.
+        """
+        runner = self.authorized_runner
+        if runner is None or not isinstance(access_token, SecretStr):
+            raise TaskAuthorizationError("Authorized task execution is unavailable.")
         ownership = self.store.get_task_ownership(task_id)
-        if ownership is None or ownership.device_id != device.id:
+        if ownership is None:
             raise TaskAuthorizationError("Task execution is not authorized.")
         task = self.store.get_task(task_id)
         goal = self.store.get_goal(task.goal_id)
-        proposal = TaskSubmissionProposal(
+        steps = self.store.list_steps(task_id)
+        if len(steps) != 1 or steps[0].action is None:
+            raise TaskAuthorizationError("Task execution is not authorized.")
+        step = steps[0]
+        persisted_proposal = TaskSubmissionProposal(
             idempotency_key=ownership.idempotency_key,
             title=goal.title,
             description=goal.description,
+            action=step.action,
         )
-        authorization = resolve_task_authorization(device, proposal, policy)
-        if authorization.request_digest != ownership.request_digest:
+        if persisted_proposal.request_digest() != ownership.request_digest:
             raise TaskAuthorizationError("Task execution is not authorized.")
-        if not callable(getattr(self.runner, "execute_authorized", None)):
-            raise TaskAuthorizationError("Authorized task execution is unavailable.")
-        return self._run_task(
-            task_id,
-            memory_access=memory_access,
-            authorization=authorization,
+        if not _PROCESS_RUN_LOCK.acquire(blocking=False):
+            raise RuntimeBusyError("A task is already being dispatched in this process.")
+        request_key = (self._database_key, task_id)
+        global _ACTIVE_TASK
+        with _CONTROL_LOCK:
+            _ACTIVE_TASK = request_key
+        try:
+            task = self.store.get_task(task_id)
+            try:
+                authorization = runner.authorize(task_id, step, access_token)
+            except TaskDispatchDeniedError as exc:
+                return self._persist_dispatch_denial(task_id, step, exc)
+            if authorization.device_id != ownership.device_id:
+                raise TaskAuthorizationError("Task execution is not authorized.")
+            if task.state in (
+                TaskState.PAUSED,
+                TaskState.CANCELLED,
+                TaskState.COMPLETED,
+                TaskState.FAILED,
+                TaskState.RECONCILIATION_REQUIRED,
+            ):
+                return task
+            if step.state is StepState.RUNNING:
+                self.store.recover_interrupted_attempt(step.id, allow_idempotent_replay=False)
+                return self.store.transition_task(task_id, TaskState.RECONCILIATION_REQUIRED)
+            if task.state is TaskState.READY:
+                task = self.store.transition_task(task_id, TaskState.RUNNING)
+            if step.state in (StepState.PENDING, StepState.RETRY_WAIT):
+                step = self.store.transition_step(step.id, StepState.READY)
+            if step.state is not StepState.READY:
+                return self.store.get_task(task_id)
+
+            attempt = self.store.start_step_attempt(
+                step.id,
+                authorization=AttemptAuthorization(
+                    device_id=authorization.device_id,
+                    action_digest=authorization.action_digest,
+                    authorization_fingerprint=authorization.fingerprint,
+                ),
+            )
+            binding = attempt.authorization_binding
+            if binding is None:
+                self.store.finish_step_attempt(
+                    step.id,
+                    AttemptOutcome.PERMANENT_FAILURE,
+                    error_code=SafeErrorCode.PERMANENT,
+                )
+                return self.store.transition_task(task_id, TaskState.FAILED)
+            try:
+                result = await runner.execute_claimed(task_id, step, access_token, binding)
+            except (
+                AuthorizationDeniedError,
+                ToolInputValidationError,
+                TaskAuthorizationError,
+            ):
+                self.store.finish_step_attempt(
+                    step.id,
+                    AttemptOutcome.PERMANENT_FAILURE,
+                    error_code=SafeErrorCode.PERMANENT,
+                )
+            except (ToolAuditError, ToolExecutionError) as exc:
+                self.store.finish_step_attempt(
+                    step.id,
+                    AttemptOutcome.OUTCOME_UNKNOWN
+                    if exc.executor_invoked
+                    else AttemptOutcome.PERMANENT_FAILURE,
+                    error_code=(
+                        SafeErrorCode.OUTCOME_UNKNOWN
+                        if exc.executor_invoked
+                        else SafeErrorCode.PERMANENT
+                    ),
+                )
+            except (ToolTimeoutError, ToolOutputValidationError, ToolResultTooLargeError):
+                self.store.finish_step_attempt(
+                    step.id,
+                    AttemptOutcome.OUTCOME_UNKNOWN,
+                    error_code=SafeErrorCode.OUTCOME_UNKNOWN,
+                )
+            except asyncio.CancelledError:
+                self.store.finish_step_attempt(
+                    step.id,
+                    AttemptOutcome.OUTCOME_UNKNOWN,
+                    error_code=SafeErrorCode.OUTCOME_UNKNOWN,
+                )
+                self.store.transition_task(task_id, TaskState.RECONCILIATION_REQUIRED)
+                raise
+            except Exception:
+                self.store.finish_step_attempt(
+                    step.id,
+                    AttemptOutcome.OUTCOME_UNKNOWN,
+                    error_code=SafeErrorCode.OUTCOME_UNKNOWN,
+                )
+            else:
+                self.store.finish_step_attempt(
+                    step.id, AttemptOutcome.SUCCEEDED, result=result
+                )
+
+            current = self.store.get_step(step.id)
+            if current.state is StepState.SUCCEEDED:
+                return self.store.transition_task(task_id, TaskState.COMPLETED)
+            if current.state is StepState.RECONCILIATION_REQUIRED:
+                return self.store.transition_task(
+                    task_id, TaskState.RECONCILIATION_REQUIRED
+                )
+            return self.store.transition_task(task_id, TaskState.FAILED)
+        finally:
+            with _CONTROL_LOCK:
+                _ACTIVE_TASK = None
+                _PAUSE_REQUESTS.discard(request_key)
+                _CANCEL_REQUESTS.discard(request_key)
+            _PROCESS_RUN_LOCK.release()
+
+    def _persist_dispatch_denial(
+        self, task_id: str, step: Step, denial: TaskDispatchDeniedError
+    ) -> Task:
+        """Record an authenticated owner's known pre-dispatch policy denial."""
+        task = self.store.get_task(task_id)
+        current = self.store.get_step(step.id)
+        if task.state is not TaskState.READY or current.state not in (
+            StepState.PENDING,
+            StepState.READY,
+            StepState.RETRY_WAIT,
+        ):
+            raise TaskAuthorizationError("Task execution is not authorized.")
+        if task.state is TaskState.READY:
+            self.store.transition_task(task_id, TaskState.RUNNING)
+        if current.state in (StepState.PENDING, StepState.RETRY_WAIT):
+            current = self.store.transition_step(current.id, StepState.READY)
+        self.store.start_step_attempt(
+            current.id,
+            denial=AttemptDenial(
+                device_id=denial.device_id,
+                action_digest=denial.action_digest,
+                authorization_fingerprint=denial.authorization_fingerprint,
+            ),
         )
+        self.store.finish_step_attempt(
+            current.id,
+            AttemptOutcome.PERMANENT_FAILURE,
+            error_code=SafeErrorCode.PERMANENT,
+        )
+        return self.store.transition_task(task_id, TaskState.FAILED)
 
     def _run_task(
         self,
@@ -295,13 +473,20 @@ class TaskRuntime:
             _PROCESS_RUN_LOCK.release()
 
     def _require_context_runner(self, *, authorized: bool = False) -> None:
+        runner = self._require_legacy_runner()
         method_name = "execute_authorized" if authorized else "execute_with_memory_context"
         if self.memory_context_assembler is not None and not callable(
-            getattr(self.runner, method_name, None)
+            getattr(runner, method_name, None)
         ):
             raise MemoryContextUnavailableError(
                 "The configured step runner cannot receive task memory context."
             )
+
+    def _require_legacy_runner(self) -> StepRunner:
+        runner = self.runner
+        if runner is None:
+            raise TaskRunnerUnavailableError("Legacy task execution is unavailable.")
+        return runner
 
     def _require_unowned_task(self, task_id: str) -> None:
         if self.store.get_task_ownership(task_id) is not None:
@@ -364,6 +549,7 @@ class TaskRuntime:
         memory_context: TaskMemoryContext | None = None,
         authorization: TaskAuthorizationContext | None = None,
     ) -> Task:
+        self._require_legacy_runner()
         task = self.store.get_task(task_id)
         if task.state in (
             TaskState.PAUSED,
@@ -425,9 +611,10 @@ class TaskRuntime:
         memory_context: TaskMemoryContext | None = None,
         authorization: TaskAuthorizationContext | None = None,
     ) -> None:
+        runner = self._require_legacy_runner()
         attempt = self.store.start_step_attempt(step.id)
         if step.replay_safety.value == "idempotent" and not getattr(
-            self.runner, "deduplicates_idempotency_keys", False
+            runner, "deduplicates_idempotency_keys", False
         ):
             self.store.finish_step_attempt(
                 attempt.step_id,
@@ -437,7 +624,7 @@ class TaskRuntime:
             return
         try:
             if authorization is not None:
-                execute_authorized = getattr(self.runner, "execute_authorized", None)
+                execute_authorized = getattr(runner, "execute_authorized", None)
                 if not callable(execute_authorized):
                     raise TaskAuthorizationError("Authorized task execution is unavailable.")
                 result = execute_authorized(
@@ -447,10 +634,10 @@ class TaskRuntime:
                     memory_context=memory_context,
                 )
             elif memory_context is None:
-                result = self.runner.execute(step, idempotency_key=step.idempotency_key)
+                result = runner.execute(step, idempotency_key=step.idempotency_key)
             else:
                 execute_with_context = getattr(
-                    self.runner, "execute_with_memory_context", None
+                    runner, "execute_with_memory_context", None
                 )
                 if not callable(execute_with_context):
                     raise MemoryContextUnavailableError(
@@ -474,7 +661,7 @@ class TaskRuntime:
         except Exception:
             safe_replay = step.replay_safety.value == "pure" or (
                 step.replay_safety.value == "idempotent"
-                and getattr(self.runner, "deduplicates_idempotency_keys", False) is True
+                and getattr(runner, "deduplicates_idempotency_keys", False) is True
             )
             self.store.finish_step_attempt(
                 step.id,
