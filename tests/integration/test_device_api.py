@@ -101,6 +101,55 @@ def test_owner_and_companion_routes_enforce_role_and_revoke_persistently(device_
     assert client.delete(f"/devices/{owner['id']}", headers=auth(owner_token)).status_code == 403
 
 
+def test_device_list_reports_conservative_presence_from_last_seen(
+    device_api, monkeypatch
+) -> None:
+    client, application, database = device_api
+    owner = pair(client, BOOTSTRAP, "owner")
+    owner_token = owner["access_token"]
+    pairing_code = client.post(
+        "/devices/pairing-codes", headers=auth(owner_token)
+    ).json()["pairing_code"]
+    companion = pair(client, pairing_code, "companion")
+
+    fixed_now = datetime.now(UTC) + timedelta(minutes=6)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return fixed_now.replace(tzinfo=None)
+            return fixed_now.astimezone(tz)
+
+    monkeypatch.setattr("jarvis.devices.api.datetime", FrozenDateTime)
+    service = application.state.device_service
+    service._store._clock = lambda: fixed_now
+
+    listing = client.get("/devices", headers=auth(owner_token))
+    assert listing.status_code == 200, listing.text
+    devices = {item["id"]: item for item in listing.json()["devices"]}
+    assert devices[owner["device"]["id"]]["presence"] == "recently_seen"
+    assert devices[companion["device"]["id"]]["presence"] == "stale"
+    assert datetime.fromisoformat(
+        devices[owner["device"]["id"]]["last_seen_at"].replace("Z", "+00:00")
+    ) == fixed_now
+
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "UPDATE devices SET last_seen_at = ? WHERE id = ?",
+            ((fixed_now + timedelta(seconds=1)).isoformat(), companion["device"]["id"]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    future_listing = client.get("/devices", headers=auth(owner_token))
+    assert future_listing.status_code == 200, future_listing.text
+    future_devices = {item["id"]: item for item in future_listing.json()["devices"]}
+    assert future_devices[companion["device"]["id"]]["presence"] == "unknown"
+
+
 def test_pairing_codes_are_one_time_and_expire_over_the_api(device_api) -> None:
     client, application, _database = device_api
     owner = pair(client, BOOTSTRAP, "owner")

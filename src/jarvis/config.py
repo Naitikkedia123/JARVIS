@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     host: Literal["127.0.0.1"] = "127.0.0.1"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     device_database_path: Path = Path("data/local/devices.sqlite3")
+    device_presence_freshness_seconds: int = Field(default=300, ge=1, le=86_400)
     owner_credential_lifetime_days: int = Field(default=30, ge=1, le=365)
     approval_lifetime_minutes: int = Field(default=5, ge=1, le=60)
     task_database_path: Path = Path("data/local/tasks.sqlite3")

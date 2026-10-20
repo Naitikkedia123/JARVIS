@@ -189,6 +189,7 @@ def create_app(
         version="0.1.0",
         lifespan=lifespan,
     )
+    application.state.settings = resolved_settings
     application.add_middleware(DeviceRequestSizeLimitMiddleware)
     application.add_middleware(TaskRequestSafetyMiddleware)
     application.include_router(device_router)

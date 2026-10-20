@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Literal
 
@@ -43,6 +43,52 @@ class DevicePlatform(StrEnum):
 class DeviceRole(StrEnum):
     OWNER = "owner"
     COMPANION = "companion"
+
+
+DEFAULT_DEVICE_PRESENCE_FRESHNESS_SECONDS = 300
+
+
+class DevicePresence(StrEnum):
+    """Conservative classification of a device's most recent authenticated contact."""
+
+    RECENTLY_SEEN = "recently_seen"
+    STALE = "stale"
+    UNKNOWN = "unknown"
+
+
+def classify_device_presence(
+    last_seen_at: datetime | None,
+    *,
+    now: datetime,
+    freshness_window: timedelta,
+) -> DevicePresence:
+    """Classify a last-seen timestamp without claiming current connectivity.
+
+    The freshness boundary is inclusive. Missing, unusable, or future timestamps
+    remain unknown; an older timestamp is stale but does not prove disconnection.
+    """
+    if freshness_window < timedelta(0):
+        raise ValueError("Device presence freshness window cannot be negative.")
+    if not _is_usable_timestamp(last_seen_at) or not _is_usable_timestamp(now):
+        return DevicePresence.UNKNOWN
+    try:
+        last_seen = last_seen_at.astimezone(UTC)
+        current = now.astimezone(UTC)
+    except (OverflowError, ValueError):
+        return DevicePresence.UNKNOWN
+    if last_seen > current:
+        return DevicePresence.UNKNOWN
+    if current - last_seen <= freshness_window:
+        return DevicePresence.RECENTLY_SEEN
+    return DevicePresence.STALE
+
+
+def _is_usable_timestamp(value: object) -> bool:
+    return (
+        isinstance(value, datetime)
+        and value.tzinfo is not None
+        and value.utcoffset() is not None
+    )
 
 
 class CapabilityReport(DeviceModel):
