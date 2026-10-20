@@ -6,11 +6,13 @@ JARVIS is a model-independent personal AI operating-system project. This reposit
 Phases 05 Memory v1, 06 Research, Sources and Browser Tools, and 07 Memory
 Retrieval and Context Assembly are merged into `main`. Phase 08 Pass D and Pass E
 are merged into `main` through PRs #12 and #13; Pass E includes the owner
-credential lifecycle and durable approval/resume work. The broader Phase 08
-cross-device synchronization, offline behavior, and Android companion remain
-unfinished. The task-owner cancellation slice is pending review on
-`feat/phase-08-task-cancellation` and has not been merged. JARVIS is not a complete
-autonomous assistant.
+credential lifecycle and durable approval/resume work. Owner-authorized task
+cancellation was merged through PR #14. Its local post-merge validation reported
+423 passed and 2 skipped because Windows policy blocked symlink creation; this
+validates the cancellation implementation, not all Phase 08 acceptance criteria.
+Phase 08 remains open while cross-device synchronization, notification events,
+offline behavior, and the Android companion are unresolved. JARVIS is not a
+complete autonomous assistant.
 
 ## Quick start (Windows PowerShell)
 ```powershell
