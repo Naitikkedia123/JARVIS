@@ -4,9 +4,10 @@ JARVIS is a model-independent personal AI operating-system project. This reposit
 
 ## Status
 Phases 05 Memory v1, 06 Research, Sources and Browser Tools, and 07 Memory
-Retrieval and Context Assembly are merged into `main`. Phase 08 device-pairing
-foundation work is in progress on `feat/phase-08-device-pairing`. JARVIS is not
-a complete autonomous assistant.
+Retrieval and Context Assembly are merged into `main`. Phase 08 Pass D is merged;
+the owner credential lifecycle prerequisite and Pass E approval/resume work are
+under review on `scratch/owner-credential-hardening` and are not yet accepted.
+JARVIS is not a complete autonomous assistant.
 
 ## Quick start (Windows PowerShell)
 ```powershell

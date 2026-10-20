@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pydantic import SecretStr
 
+from jarvis.devices.models import Device
 from jarvis.devices.service import DeviceService
 from jarvis.policy.allowlist import DeviceTaskToolPolicy
 from jarvis.tasks.authorization import (
@@ -16,7 +17,11 @@ from jarvis.tasks.models import AttemptAuthorizationBinding, Step, StepResult
 from jarvis.tasks.store import TaskStore
 from jarvis.tools.dispatcher import ToolDispatcher
 from jarvis.tools.errors import AuthorizationDeniedError, ToolAuditError, ToolExecutionError
-from jarvis.tools.models import ToolExecutionCorrelation
+from jarvis.tools.models import (
+    ApprovedTaskActionPermit,
+    ToolDefinition,
+    ToolExecutionCorrelation,
+)
 
 
 class DispatcherBackedTaskRunner:
@@ -48,6 +53,12 @@ class DispatcherBackedTaskRunner:
             device = self.device_service.authenticate(access_token)
         except Exception:
             raise TaskAuthorizationError("Task execution is not authorized.") from None
+        return self.authorize_authenticated_device(task_id, step, device)
+
+    def authorize_authenticated_device(
+        self, task_id: str, step: Step, device: Device
+    ) -> DispatchAuthorization:
+        """Authorize a trusted DeviceStore identity without opening another auth transaction."""
         try:
             ownership = self.store.get_task_ownership(task_id)
             current = self.store.get_step(step.id)
@@ -76,9 +87,13 @@ class DispatcherBackedTaskRunner:
         step: Step,
         access_token: SecretStr,
         binding: AttemptAuthorizationBinding,
+        *,
+        dispatch_claimed: bool = False,
+        approval_permit: ApprovedTaskActionPermit | None = None,
     ) -> StepResult:
         """Reauthenticate and reauthorize immediately before the dispatcher call."""
-        self.store.claim_dispatch(binding)
+        if not dispatch_claimed:
+            self.store.claim_dispatch(binding)
         authorization = self.authorize(task_id, step, access_token)
         if (
             binding.task_id != task_id
@@ -102,6 +117,7 @@ class DispatcherBackedTaskRunner:
                 step.action.to_tool_request(),
                 authorization_context=authorization.tool_authorization,
                 correlation=correlation,
+                approval_permit=approval_permit,
             )
         except (AuthorizationDeniedError, ToolAuditError, ToolExecutionError):
             raise
@@ -109,3 +125,45 @@ class DispatcherBackedTaskRunner:
             # A failure after entering dispatch has no reliable effect boundary.
             raise
         return StepResult(data=result.output.model_dump(mode="json"))
+
+    def inspect_approval_action(
+        self, task_id: str, step: Step, access_token: SecretStr
+    ) -> tuple[DispatchAuthorization, ToolDefinition]:
+        """Freshly authorize and validate an action before creating durable approval."""
+        authorization = self.authorize(task_id, step, access_token)
+        if step.action is None:
+            raise TaskAuthorizationError("Task execution is not authorized.")
+        definition = self.dispatcher.inspect_authorized_request(
+            step.action.to_tool_request(), authorization.tool_authorization
+        )
+        return authorization, definition
+
+    def inspect_stored_approval_action(
+        self, task_id: str, step: Step, device_id: str
+    ) -> tuple[DispatchAuthorization, ToolDefinition]:
+        """Recheck a persisted task device, current grant, definition, and input."""
+        device = self.device_service.get_device(device_id)
+        return self.inspect_approval_action_for_device(task_id, step, device)
+
+    def inspect_approval_action_for_device(
+        self, task_id: str, step: Step, device: Device
+    ) -> tuple[DispatchAuthorization, ToolDefinition]:
+        """Inspect an action using the DeviceStore identity held by a reservation."""
+        if step.action is None:
+            raise TaskAuthorizationError("Task execution is not authorized.")
+        ownership = self.store.get_task_ownership(task_id)
+        current = self.store.get_step(step.id)
+        if (
+            ownership is None
+            or ownership.device_id != device.id
+            or device.revoked_at is not None
+            or current.task_id != task_id
+            or current.action is None
+            or current.action.digest() != step.action.digest()
+        ):
+            raise TaskAuthorizationError("Task execution is not authorized.")
+        authorization = resolve_dispatch_authorization(device, current.action, self.policy)
+        definition = self.dispatcher.inspect_authorized_request(
+            current.action.to_tool_request(), authorization.tool_authorization
+        )
+        return authorization, definition

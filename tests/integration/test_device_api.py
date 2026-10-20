@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -285,3 +286,107 @@ def test_pairing_storage_failure_rolls_back_code_consumption(device_api) -> None
     )
     assert retried.status_code == 201
     assert "private sqlite detail" not in retried.text
+
+
+def test_owner_credential_rotation_is_owner_only_uncached_and_invalidates_old_token(
+    device_api,
+) -> None:
+    client, _application, database = device_api
+    owner = pair(client, BOOTSTRAP, "owner")
+    owner_token = owner["access_token"]
+    pairing_code = client.post(
+        "/devices/pairing-codes", headers=auth(owner_token)
+    ).json()["pairing_code"]
+    companion = pair(client, pairing_code, "companion")
+
+    denied = client.post(
+        "/devices/owner-credential/rotate",
+        headers=auth(companion["access_token"]),
+    )
+    assert denied.status_code == 403
+    assert owner_token not in denied.text
+    assert companion["access_token"] not in denied.text
+
+    rotated = client.post(
+        "/devices/owner-credential/rotate",
+        headers=auth(owner_token),
+    )
+    assert rotated.status_code == 200
+    assert rotated.headers["cache-control"] == "no-store"
+    assert rotated.headers["pragma"] == "no-cache"
+    payload = rotated.json()
+    assert set(payload) == {"device", "access_token", "expires_at"}
+    replacement = payload["access_token"]
+    assert replacement != owner_token
+    assert owner_token not in rotated.text
+    audit_connection = sqlite3.connect(database)
+    audit_event = audit_connection.execute(
+        "SELECT event_type, device_id, actor, origin, outcome "
+        "FROM device_credential_audit_events"
+    ).fetchone()
+    audit_connection.close()
+    assert audit_event == (
+        "owner_credential_rotated",
+        owner["device"]["id"],
+        "authenticated_owner",
+        "owner_rotation_api",
+        "success",
+    )
+
+    old_auth = client.get("/devices/me", headers=auth(owner_token))
+    assert old_auth.status_code == 401
+    assert owner_token not in old_auth.text
+    assert client.get("/devices/me", headers=auth(replacement)).status_code == 200
+
+    connection = sqlite3.connect(database)
+    stored_digest, stored_expiry = connection.execute(
+        "SELECT token_digest, owner_credential_expires_at FROM devices WHERE role = 'owner'"
+    ).fetchone()
+    connection.close()
+    assert stored_digest == hashlib.sha256(replacement.encode()).hexdigest()
+    assert replacement not in stored_digest
+    assert datetime.fromisoformat(stored_expiry) == datetime.fromisoformat(payload["expires_at"])
+
+
+def test_owner_rotation_limit_rejects_without_mutation_or_success_audit(device_api) -> None:
+    client, _application, database = device_api
+    owner = pair(client, BOOTSTRAP, "owner")
+    current_token = owner["access_token"]
+
+    for _ in range(5):
+        rotated = client.post(
+            "/devices/owner-credential/rotate",
+            headers=auth(current_token),
+        )
+        assert rotated.status_code == 200
+        current_token = rotated.json()["access_token"]
+
+    before = sqlite3.connect(database)
+    digest_before, = before.execute(
+        "SELECT token_digest FROM devices WHERE role = 'owner'"
+    ).fetchone()
+    audit_count_before, = before.execute(
+        "SELECT COUNT(*) FROM device_credential_audit_events "
+        "WHERE event_type = 'owner_credential_rotated'"
+    ).fetchone()
+    before.close()
+
+    limited = client.post(
+        "/devices/owner-credential/rotate",
+        headers={**auth(current_token), "X-Forwarded-For": "203.0.113.77"},
+    )
+    assert limited.status_code == 429
+    assert limited.headers["retry-after"] == "3600"
+    assert client.get("/devices/me", headers=auth(current_token)).status_code == 200
+
+    after = sqlite3.connect(database)
+    digest_after, = after.execute(
+        "SELECT token_digest FROM devices WHERE role = 'owner'"
+    ).fetchone()
+    audit_count_after, = after.execute(
+        "SELECT COUNT(*) FROM device_credential_audit_events "
+        "WHERE event_type = 'owner_credential_rotated'"
+    ).fetchone()
+    after.close()
+    assert digest_after == digest_before
+    assert audit_count_after == audit_count_before == 5

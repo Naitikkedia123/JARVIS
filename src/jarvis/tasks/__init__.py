@@ -11,6 +11,10 @@ from jarvis.tasks.errors import (
     TaskStoreError,
 )
 from jarvis.tasks.models import (
+    ApprovalAuditEvent,
+    ApprovalAuditEventType,
+    ApprovalRequestRecord,
+    ApprovalStatus,
     AttemptOutcome,
     EventMetadata,
     Goal,
@@ -39,6 +43,10 @@ from jarvis.tasks.store import TaskStore
 
 __all__ = [
     "ActiveAttemptError",
+    "ApprovalAuditEvent",
+    "ApprovalAuditEventType",
+    "ApprovalRequestRecord",
+    "ApprovalStatus",
     "AttemptOutcome",
     "DependencyNotSatisfiedError",
     "EntityNotFoundError",

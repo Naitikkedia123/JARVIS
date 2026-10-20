@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import secrets
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 from pydantic import SecretStr
@@ -14,6 +15,7 @@ from jarvis.devices.models import (
     Device,
     DevicePlatform,
     DeviceRole,
+    OwnerCredentialReceipt,
     PairingMetadata,
     PairingReceipt,
 )
@@ -98,6 +100,139 @@ class DeviceService:
         except DeviceNotFoundError as exc:
             raise DeviceAuthenticationError("Device authentication failed.") from exc
 
+    @contextmanager
+    def reserve_authenticated_owner_credential(
+        self, access_token: SecretStr
+    ) -> Iterator[Device]:
+        """Keep a validated owner credential stable through a TaskStore commit."""
+        if not isinstance(access_token, SecretStr):
+            raise DeviceAuthenticationError("Device authentication failed.")
+        token = access_token.get_secret_value()
+        if not token or len(token) > 256:
+            raise DeviceAuthenticationError("Device authentication failed.")
+        owner = self.authenticate(access_token)
+        if owner.role is not DeviceRole.OWNER:
+            raise DeviceAuthenticationError("Device authentication failed.")
+        try:
+            with self._store.reserve_owner_credential(
+                owner_id=owner.id,
+                expected_generation=owner.credential_generation,
+                token_digest=_sha256(token),
+            ) as reserved_owner:
+                yield reserved_owner
+        except DeviceNotFoundError as exc:
+            raise DeviceAuthenticationError("Device authentication failed.") from exc
+
+    @contextmanager
+    def reserve_owner_generation(
+        self, owner_id: str, expected_generation: int
+    ) -> Iterator[Device]:
+        """Serialize a task resume against rotation or host-local recovery."""
+        try:
+            with self._store.reserve_owner_credential(
+                owner_id=owner_id,
+                expected_generation=expected_generation,
+            ) as owner:
+                yield owner
+        except DeviceNotFoundError as exc:
+            raise DeviceAuthenticationError("Device authentication failed.") from exc
+
+    @contextmanager
+    def reserve_approval_resume(
+        self,
+        access_token: SecretStr,
+        *,
+        approval_owner_id: str,
+        approval_owner_generation: int,
+        task_owner_id: str,
+    ) -> Iterator[tuple[Device, Device]]:
+        """Reserve the approval owner and authenticated task owner together."""
+        if not isinstance(access_token, SecretStr):
+            raise DeviceAuthenticationError("Device authentication failed.")
+        token = access_token.get_secret_value()
+        if not token or len(token) > 256:
+            raise DeviceAuthenticationError("Device authentication failed.")
+        try:
+            with self._store.reserve_approval_resume(
+                approval_owner_id=approval_owner_id,
+                approval_owner_generation=approval_owner_generation,
+                task_owner_id=task_owner_id,
+                task_owner_token_digest=_sha256(token),
+            ) as devices:
+                yield devices
+        except DeviceNotFoundError as exc:
+            raise DeviceAuthenticationError("Device authentication failed.") from exc
+
+    def validate_reserved_approval_resume(
+        self,
+        access_token: SecretStr,
+        *,
+        approval_owner_id: str,
+        approval_owner_generation: int,
+        task_owner_id: str,
+    ) -> tuple[Device, Device]:
+        """Revalidate both identities and the task-owner bearer under reservation."""
+        if not isinstance(access_token, SecretStr):
+            raise DeviceAuthenticationError("Device authentication failed.")
+        token = access_token.get_secret_value()
+        if not token or len(token) > 256:
+            raise DeviceAuthenticationError("Device authentication failed.")
+        try:
+            approval_owner = self._store.validate_reserved_owner_credential(
+                owner_id=approval_owner_id,
+                expected_generation=approval_owner_generation,
+            )
+            task_owner = self._store.validate_reserved_task_device(
+                device_id=task_owner_id,
+                token_digest=_sha256(token),
+            )
+            return approval_owner, task_owner
+        except DeviceNotFoundError as exc:
+            raise DeviceAuthenticationError("Device authentication failed.") from exc
+
+    def validate_reserved_owner_generation(
+        self,
+        owner_id: str,
+        expected_generation: int,
+        *,
+        access_token: SecretStr | None = None,
+    ) -> Device:
+        """Recheck expiry/generation immediately before a TaskStore commit."""
+        token_digest: str | None = None
+        if access_token is not None:
+            if not isinstance(access_token, SecretStr):
+                raise DeviceAuthenticationError("Device authentication failed.")
+            token = access_token.get_secret_value()
+            if not token or len(token) > 256:
+                raise DeviceAuthenticationError("Device authentication failed.")
+            token_digest = _sha256(token)
+        try:
+            return self._store.validate_reserved_owner_credential(
+                owner_id=owner_id,
+                expected_generation=expected_generation,
+                token_digest=token_digest,
+            )
+        except DeviceNotFoundError as exc:
+            raise DeviceAuthenticationError("Device authentication failed.") from exc
+
+    def get_device(self, device_id: str) -> Device:
+        """Read current device lifecycle metadata for an already trusted binding."""
+        try:
+            return self._store.get_device(device_id)
+        except DeviceNotFoundError:
+            raise DeviceAuthenticationError("Device authentication failed.") from None
+
+    def get_active_owner(self) -> Device:
+        """Return the unique active owner identity and current credential generation."""
+        owners = tuple(
+            device
+            for device in self._store.list_devices()
+            if device.role is DeviceRole.OWNER and device.revoked_at is None
+        )
+        if len(owners) != 1:
+            raise DeviceAuthenticationError("Device authentication failed.")
+        return owners[0]
+
     def issue_pairing_code(self, owner_token: SecretStr) -> SecretStr:
         owner = self.authenticate(owner_token)
         if owner.role is not DeviceRole.OWNER:
@@ -112,6 +247,28 @@ class DeviceService:
             now.astimezone(UTC) + PAIRING_CODE_TTL,
         )
         return SecretStr(code)
+
+    def rotate_owner_credential(self, access_token: SecretStr) -> OwnerCredentialReceipt:
+        """Replace the current owner's bearer only after fresh active-owner auth."""
+        owner = self.authenticate(access_token)
+        if owner.role is not DeviceRole.OWNER:
+            raise DeviceAuthorizationError("Device is not authorized to rotate the owner credential.")
+        replacement = secrets.token_urlsafe(32)
+        try:
+            expires_at = self._store.rotate_owner_credential(
+                owner.id,
+                _sha256(access_token.get_secret_value()),
+                _sha256(replacement),
+            )
+        except DeviceNotFoundError as exc:
+            # A concurrent rotation or expiry between authentication and the
+            # transactional replacement invalidates this attempt.
+            raise DeviceAuthenticationError("Device authentication failed.") from exc
+        return OwnerCredentialReceipt(
+            device=self._store.get_device(owner.id),
+            access_token=SecretStr(replacement),
+            expires_at=expires_at,
+        )
 
     def update_reported_capabilities(
         self, access_token: SecretStr, capabilities: frozenset[str]

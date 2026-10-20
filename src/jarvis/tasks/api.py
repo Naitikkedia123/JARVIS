@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError
@@ -13,11 +14,17 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from jarvis.devices.api import authenticated_device
-from jarvis.devices.models import Device
+from jarvis.devices.models import Device, DeviceRole
 from jarvis.tasks.action import AuthorizedTaskAction
 from jarvis.tasks.authorization import TaskSubmissionPolicy, TaskSubmissionProposal
-from jarvis.tasks.errors import EntityNotFoundError, TaskStoreError
+from jarvis.tasks.errors import (
+    EntityNotFoundError,
+    InvalidTransitionError,
+    TaskAuthorizationError,
+    TaskStoreError,
+)
 from jarvis.tasks.models import (
+    ApprovalStatus,
     AttemptOutcome,
     SafeErrorCode,
     Step,
@@ -106,7 +113,13 @@ class TaskRequestSafetyMiddleware:
         if (
             scope["type"] != "http"
             or scope.get("method") != "POST"
-            or scope.get("path") != "/tasks"
+            or not (
+                scope.get("path") == "/tasks"
+                or (
+                    scope.get("path", "").startswith("/tasks/approvals/")
+                    and scope.get("path", "").endswith("/decision")
+                )
+            )
         ):
             await self.app(scope, receive, send)
             return
@@ -230,6 +243,20 @@ class TaskStatusResponse(BaseModel):
     progress: TaskProgressResponse
     result: StatusOutput | None
     steps: tuple[TaskStepStatusResponse, ...]
+
+
+class ApprovalDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    decision: Literal["approve", "deny"]
+
+
+class ApprovalDecisionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    approval_id: UUID
+    status: ApprovalStatus
+    expires_at: datetime
 
 
 def _task_store(request: Request) -> TaskStore:
@@ -371,9 +398,67 @@ async def get_task_status(
         raise HTTPException(status_code=404, detail="Task was not found.") from None
     except (TaskStoreError, sqlite3.Error, TypeError, ValueError):
         raise HTTPException(status_code=503, detail="Task status is unavailable.") from None
-
     response.headers["Cache-Control"] = "no-store"
     try:
         return _project_task_status(plan, store)
     except (TaskStoreError, sqlite3.Error, TypeError, ValueError):
         raise HTTPException(status_code=503, detail="Task status is unavailable.") from None
+
+
+@router.post("/approvals/{approval_id}/decision", response_model=ApprovalDecisionResponse)
+async def decide_approval(
+    approval_id: UUID,
+    payload: ApprovalDecisionRequest,
+    authenticated: Annotated[tuple[SecretStr, Device], Depends(authenticated_device)],
+    runtime: Annotated[TaskRuntime, Depends(_task_runtime)],
+    response: Response,
+) -> ApprovalDecisionResponse:
+    """Record an owner decision only; this route never resumes task execution."""
+    if authenticated[1].role is not DeviceRole.OWNER:
+        raise HTTPException(status_code=404, detail="Approval request was not found.")
+    try:
+        decision = runtime.decide_approval(
+            approval_id,
+            authenticated[0],
+            approve=payload.decision == "approve",
+        )
+    except EntityNotFoundError:
+        raise HTTPException(status_code=404, detail="Approval request was not found.") from None
+    except InvalidTransitionError:
+        raise HTTPException(
+            status_code=409, detail="Approval request is unavailable for decision."
+        ) from None
+    except (TaskStoreError, sqlite3.Error, TypeError, ValueError):
+        raise HTTPException(status_code=503, detail="Approval decision is unavailable.") from None
+    response.headers["Cache-Control"] = "no-store"
+    return ApprovalDecisionResponse(
+        approval_id=decision.request_id,
+        status=decision.status,
+        expires_at=decision.expires_at,
+    )
+
+
+@router.post("/{task_id}/resume", response_model=TaskStatusResponse)
+async def resume_approved_task(
+    task_id: str,
+    authenticated: Annotated[tuple[SecretStr, Device], Depends(authenticated_device)],
+    store: Annotated[TaskStore, Depends(_task_store)],
+    runtime: Annotated[TaskRuntime, Depends(_task_runtime)],
+    response: Response,
+) -> TaskStatusResponse:
+    """Resume one approved action only after fresh task-owner authentication."""
+    try:
+        await runtime.resume_approved_task_async(task_id, authenticated[0])
+        plan = store.get_task_plan_for_device(task_id, authenticated[1].id)
+        projected = _project_task_status(plan, store)
+    except EntityNotFoundError:
+        raise HTTPException(status_code=404, detail="Task was not found.") from None
+    except InvalidTransitionError:
+        raise HTTPException(status_code=409, detail="Task is unavailable for resume.") from None
+    except TaskAuthorizationError:
+        # Unknown and foreign task IDs share the same response on this route.
+        raise HTTPException(status_code=404, detail="Task was not found.") from None
+    except (TaskStoreError, sqlite3.Error, TypeError, ValueError):
+        raise HTTPException(status_code=503, detail="Task resume is unavailable.") from None
+    response.headers["Cache-Control"] = "no-store"
+    return projected

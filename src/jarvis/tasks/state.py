@@ -3,7 +3,13 @@
 from collections.abc import Iterable, Mapping
 
 from jarvis.tasks.errors import InvalidDependencyError, InvalidTransitionError
-from jarvis.tasks.models import GoalState, Step, StepState, TaskState
+from jarvis.tasks.models import (
+    ApprovalStatus,
+    GoalState,
+    Step,
+    StepState,
+    TaskState,
+)
 
 GOAL_TRANSITIONS: dict[GoalState, frozenset[GoalState]] = {
     GoalState.ACTIVE: frozenset(
@@ -16,7 +22,9 @@ GOAL_TRANSITIONS: dict[GoalState, frozenset[GoalState]] = {
 }
 
 TASK_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
-    TaskState.READY: frozenset({TaskState.RUNNING, TaskState.PAUSED, TaskState.CANCELLED}),
+    TaskState.READY: frozenset(
+        {TaskState.RUNNING, TaskState.PAUSED, TaskState.WAITING_APPROVAL, TaskState.CANCELLED}
+    ),
     TaskState.RUNNING: frozenset(
         {
             TaskState.READY,
@@ -30,6 +38,9 @@ TASK_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
     TaskState.PAUSED: frozenset(
         {TaskState.READY, TaskState.CANCELLING, TaskState.CANCELLED}
     ),
+    TaskState.WAITING_APPROVAL: frozenset(
+        {TaskState.RUNNING, TaskState.FAILED}
+    ),
     TaskState.CANCELLING: frozenset(
         {TaskState.CANCELLED, TaskState.RECONCILIATION_REQUIRED}
     ),
@@ -42,9 +53,11 @@ TASK_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
 }
 
 STEP_TRANSITIONS: dict[StepState, frozenset[StepState]] = {
-    StepState.PENDING: frozenset({StepState.READY, StepState.CANCELLED}),
+    StepState.PENDING: frozenset(
+        {StepState.READY, StepState.WAITING_APPROVAL, StepState.CANCELLED}
+    ),
     StepState.READY: frozenset(
-        {StepState.RUNNING, StepState.PAUSED, StepState.CANCELLED}
+        {StepState.RUNNING, StepState.PAUSED, StepState.WAITING_APPROVAL, StepState.CANCELLED}
     ),
     StepState.RUNNING: frozenset(
         {
@@ -57,12 +70,34 @@ STEP_TRANSITIONS: dict[StepState, frozenset[StepState]] = {
     ),
     StepState.RETRY_WAIT: frozenset({StepState.READY, StepState.CANCELLED}),
     StepState.PAUSED: frozenset({StepState.READY, StepState.CANCELLED}),
+    StepState.WAITING_APPROVAL: frozenset(
+        {StepState.RUNNING, StepState.FAILED}
+    ),
     StepState.RECONCILIATION_REQUIRED: frozenset(
         {StepState.SUCCEEDED, StepState.READY, StepState.FAILED}
     ),
     StepState.SUCCEEDED: frozenset(),
     StepState.FAILED: frozenset(),
     StepState.CANCELLED: frozenset(),
+}
+
+# This describes the approval lifecycle persisted by TaskStore.
+APPROVAL_TRANSITIONS: dict[ApprovalStatus, frozenset[ApprovalStatus]] = {
+    ApprovalStatus.PENDING: frozenset(
+        {
+            ApprovalStatus.APPROVED,
+            ApprovalStatus.DENIED,
+            ApprovalStatus.EXPIRED,
+            ApprovalStatus.REVOKED,
+        }
+    ),
+    ApprovalStatus.APPROVED: frozenset(
+        {ApprovalStatus.EXPIRED, ApprovalStatus.REVOKED, ApprovalStatus.CONSUMED}
+    ),
+    ApprovalStatus.DENIED: frozenset(),
+    ApprovalStatus.EXPIRED: frozenset(),
+    ApprovalStatus.REVOKED: frozenset(),
+    ApprovalStatus.CONSUMED: frozenset(),
 }
 
 
@@ -76,6 +111,12 @@ def validate_task_transition(current: TaskState, target: TaskState) -> None:
 
 def validate_step_transition(current: StepState, target: StepState) -> None:
     _validate_transition("step", current, target, STEP_TRANSITIONS)
+
+
+def validate_approval_transition(
+    current: ApprovalStatus, target: ApprovalStatus
+) -> None:
+    _validate_transition("approval", current, target, APPROVAL_TRANSITIONS)
 
 
 def _validate_transition(state_name: str, current: object, target: object, transitions: Mapping) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Protocol
@@ -11,6 +12,7 @@ from uuid import UUID, uuid5
 from pydantic import SecretStr
 
 from jarvis.devices.models import Device
+from jarvis.devices.service import DeviceAuthenticationError
 from jarvis.memory.context import MemoryContextAssembler, TaskMemoryContext
 from jarvis.memory.errors import MemoryError
 from jarvis.memory.models import RetrievalContext
@@ -23,13 +25,18 @@ from jarvis.tasks.authorization import (
     resolve_task_authorization,
 )
 from jarvis.tasks.errors import (
+    EntityNotFoundError,
     InvalidTransitionError,
+    RetryLimitExceededError,
     TaskAuthorizationError,
     TaskDispatchDeniedError,
     TaskError,
     TaskRunnerUnavailableError,
+    TaskStoreError,
 )
 from jarvis.tasks.models import (
+    ApprovalRequestRecord,
+    ApprovalStatus,
     AttemptAuthorization,
     AttemptDenial,
     AttemptOutcome,
@@ -57,6 +64,7 @@ from jarvis.tools.errors import (
     ToolResultTooLargeError,
     ToolTimeoutError,
 )
+from jarvis.tools.models import ApprovedTaskActionPermit
 
 
 class StepRunner(Protocol):
@@ -136,12 +144,16 @@ class TaskRuntime:
         *,
         memory_context_assembler: MemoryContextAssembler | None = None,
         authorized_runner: DispatcherBackedTaskRunner | None = None,
+        approval_lifetime_minutes: int = 5,
     ) -> None:
         self.store = store
         self.planner = planner
         self.runner = runner
         self.memory_context_assembler = memory_context_assembler
         self.authorized_runner = authorized_runner
+        if not 1 <= approval_lifetime_minutes <= 60:
+            raise ValueError("Approval lifetime must be between one and sixty minutes.")
+        self.approval_lifetime = timedelta(minutes=approval_lifetime_minutes)
         self._database_key = str(Path(store.db_path).resolve())
 
     def create_task(self, goal_id: str) -> TaskPlan:
@@ -310,12 +322,39 @@ class TaskRuntime:
                 return self._persist_dispatch_denial(task_id, step, exc)
             if authorization.device_id != ownership.device_id:
                 raise TaskAuthorizationError("Task execution is not authorized.")
+            if isinstance(runner, DispatcherBackedTaskRunner) and task.state is TaskState.READY and step.state in (
+                StepState.PENDING,
+                StepState.READY,
+            ) and step.attempt_count == 0:
+                try:
+                    authorization, definition = runner.inspect_approval_action(
+                        task_id, step, access_token
+                    )
+                except TaskDispatchDeniedError as exc:
+                    return self._persist_dispatch_denial(task_id, step, exc)
+                if definition.requires_approval:
+                    owner = runner.device_service.get_active_owner()
+                    now = self.store.current_time()
+                    request = ApprovalRequestRecord(
+                        task_id=task_id,
+                        step_id=step.id,
+                        requesting_device_id=authorization.device_id,
+                        owner_device_id=owner.id,
+                        owner_credential_generation=owner.credential_generation,
+                        action_digest=authorization.action_digest,
+                        tool_definition_digest=definition.definition_digest(),
+                        created_at=now,
+                        expires_at=now + self.approval_lifetime,
+                    )
+                    self.store.create_approval_request(request)
+                    return self.store.get_task(task_id)
             if task.state in (
                 TaskState.PAUSED,
                 TaskState.CANCELLED,
                 TaskState.COMPLETED,
                 TaskState.FAILED,
                 TaskState.RECONCILIATION_REQUIRED,
+                TaskState.WAITING_APPROVAL,
             ):
                 return task
             if step.state is StepState.RUNNING:
@@ -407,6 +446,257 @@ class TaskRuntime:
                 _ACTIVE_TASK = None
                 _PAUSE_REQUESTS.discard(request_key)
                 _CANCEL_REQUESTS.discard(request_key)
+            _PROCESS_RUN_LOCK.release()
+
+    def decide_approval(
+        self,
+        request_id: UUID | str,
+        access_token: SecretStr,
+        *,
+        approve: bool,
+    ) -> ApprovalRequestRecord:
+        """Record an owner decision without resuming or executing the task."""
+        runner = self.authorized_runner
+        if runner is None:
+            raise TaskAuthorizationError("Approval decisions are unavailable.")
+        try:
+            with runner.device_service.reserve_authenticated_owner_credential(
+                access_token
+            ) as owner:
+                request = self.store.get_approval_request(request_id)
+                if request.owner_device_id != owner.id:
+                    raise EntityNotFoundError("Approval request was not found.")
+                step = self.store.get_step(request.step_id)
+                action_digest = "0" * 64 if step.action is None else step.action.digest()
+                tool_definition_digest = "0" * 64
+                try:
+                    _, definition = runner.inspect_stored_approval_action(
+                        request.task_id, step, request.requesting_device_id
+                    )
+                    tool_definition_digest = definition.definition_digest()
+                    if not definition.requires_approval:
+                        tool_definition_digest = "0" * 64
+                except Exception:
+                    # The store records a safe revocation event for an unusable binding.
+                    pass
+                return self.store.decide_approval_request(
+                    request.request_id,
+                    owner_device_id=owner.id,
+                    owner_credential_generation=owner.credential_generation,
+                    action_digest=action_digest,
+                    tool_definition_digest=tool_definition_digest,
+                    approve=approve,
+                    precommit_validation=lambda: runner.device_service.validate_reserved_owner_generation(
+                        owner.id,
+                        owner.credential_generation,
+                        access_token=access_token,
+                    ),
+                )
+        except DeviceAuthenticationError:
+            raise TaskAuthorizationError("Approval decision is not authorized.") from None
+
+    async def resume_approved_task_async(
+        self, task_id: str, access_token: SecretStr
+    ) -> Task:
+        """Consume an exact owner approval and execute only its bound task step."""
+        runner = self.authorized_runner
+        if runner is None or not isinstance(access_token, SecretStr):
+            raise TaskAuthorizationError("Authorized task resume is unavailable.")
+        ownership = self.store.get_task_ownership(task_id)
+        if ownership is None:
+            raise EntityNotFoundError("Task was not found.")
+        task = self.store.get_task(task_id)
+        steps = self.store.list_steps(task_id)
+        if len(steps) != 1 or steps[0].action is None:
+            raise TaskAuthorizationError("Task resume is not authorized.")
+        step = steps[0]
+        if task.state is not TaskState.WAITING_APPROVAL or step.state is not StepState.WAITING_APPROVAL:
+            raise InvalidTransitionError("Task is not waiting for approval.")
+        requests = self.store.list_approval_requests(task_id)
+        approved = tuple(item for item in requests if item.status is ApprovalStatus.APPROVED)
+        if len(approved) != 1:
+            raise InvalidTransitionError("An approved request is unavailable for resume.")
+        request = approved[0]
+        if not _PROCESS_RUN_LOCK.acquire(blocking=False):
+            raise RuntimeBusyError("A task is already being dispatched in this process.")
+        try:
+            try:
+                authenticated_device = runner.device_service.authenticate(access_token)
+            except Exception:
+                raise TaskAuthorizationError("Task resume is not authorized.") from None
+            if authenticated_device.id != ownership.device_id:
+                raise TaskAuthorizationError("Task resume is not authorized.")
+            if step.action.digest() != request.action_digest:
+                self.store.invalidate_approved_approval(
+                    request.request_id, reason_code="action_binding_changed"
+                )
+                raise InvalidTransitionError("Approved task is unavailable for resume.")
+            authorization = runner.authorize(task_id, step, access_token)
+            if authorization.device_id != ownership.device_id:
+                raise TaskAuthorizationError("Task resume is not authorized.")
+            try:
+                _, definition = runner.inspect_stored_approval_action(
+                    task_id, step, ownership.device_id
+                )
+            except Exception:
+                definition = None
+            action_digest = step.action.digest()
+            tool_definition_digest = (
+                "0" * 64
+                if definition is None or not definition.requires_approval
+                else definition.definition_digest()
+            )
+            try:
+                with runner.device_service.reserve_approval_resume(
+                    access_token,
+                    approval_owner_id=request.owner_device_id,
+                    approval_owner_generation=request.owner_credential_generation,
+                    task_owner_id=ownership.device_id,
+                ) as (current_owner, current_task_owner):
+                    if current_task_owner.id != ownership.device_id:
+                        raise DeviceAuthenticationError("Device authentication failed.")
+                    authorization, definition = runner.inspect_approval_action_for_device(
+                        task_id, step, current_task_owner
+                    )
+                    tool_definition_digest = (
+                        "0" * 64
+                        if not definition.requires_approval
+                        else definition.definition_digest()
+                    )
+
+                    def validate_resume_authorization() -> None:
+                        _reserved_approval_owner, reserved_task_owner = (
+                            runner.device_service.validate_reserved_approval_resume(
+                                access_token,
+                                approval_owner_id=request.owner_device_id,
+                                approval_owner_generation=request.owner_credential_generation,
+                                task_owner_id=ownership.device_id,
+                            )
+                        )
+                        current_authorization, current_definition = (
+                            runner.inspect_approval_action_for_device(
+                                task_id, step, reserved_task_owner
+                            )
+                        )
+                        current_definition_digest = (
+                            "0" * 64
+                            if not current_definition.requires_approval
+                            else current_definition.definition_digest()
+                        )
+                        if (
+                            current_authorization.fingerprint != authorization.fingerprint
+                            or current_definition_digest != tool_definition_digest
+                        ):
+                            raise TaskAuthorizationError(
+                                "Task resume is not authorized."
+                            )
+
+                    attempt = self.store.consume_approval_and_start_attempt(
+                        request.request_id,
+                        requesting_device_id=ownership.device_id,
+                        owner_credential_generation=current_owner.credential_generation,
+                        action_digest=action_digest,
+                        tool_definition_digest=tool_definition_digest,
+                        authorization=AttemptAuthorization(
+                            device_id=authorization.device_id,
+                            action_digest=authorization.action_digest,
+                            authorization_fingerprint=authorization.fingerprint,
+                        ),
+                        precommit_validation=validate_resume_authorization,
+                    )
+            except DeviceAuthenticationError:
+                latest = self.store.get_approval_request(request.request_id)
+                if latest.status is ApprovalStatus.APPROVED:
+                    self.store.invalidate_approved_approval(
+                        request.request_id, reason_code="owner_credential_changed"
+                    )
+                raise InvalidTransitionError(
+                    "Approved task is unavailable for resume."
+                ) from None
+            except (InvalidTransitionError, RetryLimitExceededError):
+                latest = self.store.get_approval_request(request.request_id)
+                if latest.status is ApprovalStatus.APPROVED:
+                    self.store.invalidate_approved_approval(
+                        request.request_id, reason_code="resume_binding_unavailable"
+                    )
+                raise
+            binding = attempt.authorization_binding
+            if binding is None:
+                raise TaskStoreError("Approval resume authorization was not persisted.")
+            permit = ApprovedTaskActionPermit(
+                request_id=str(request.request_id),
+                task_id=request.task_id,
+                step_id=request.step_id,
+                tool_name=step.action.tool_name,
+                action_digest=request.action_digest,
+                tool_definition_digest=request.tool_definition_digest,
+            )
+            try:
+                result = await runner.execute_claimed(
+                    task_id,
+                    step,
+                    access_token,
+                    binding,
+                    dispatch_claimed=True,
+                    approval_permit=permit,
+                )
+            except (
+                AuthorizationDeniedError,
+                ToolApprovalRequiredError,
+                ToolInputValidationError,
+                TaskAuthorizationError,
+            ):
+                self.store.finish_step_attempt(
+                    step.id,
+                    AttemptOutcome.PERMANENT_FAILURE,
+                    error_code=SafeErrorCode.PERMANENT,
+                )
+            except (ToolAuditError, ToolExecutionError) as exc:
+                outcome = (
+                    AttemptOutcome.OUTCOME_UNKNOWN
+                    if exc.executor_invoked
+                    else AttemptOutcome.PERMANENT_FAILURE
+                )
+                self.store.finish_step_attempt(
+                    step.id,
+                    outcome,
+                    error_code=(
+                        SafeErrorCode.OUTCOME_UNKNOWN
+                        if exc.executor_invoked
+                        else SafeErrorCode.PERMANENT
+                    ),
+                )
+            except (ToolTimeoutError, ToolOutputValidationError, ToolResultTooLargeError):
+                self.store.finish_step_attempt(
+                    step.id,
+                    AttemptOutcome.OUTCOME_UNKNOWN,
+                    error_code=SafeErrorCode.OUTCOME_UNKNOWN,
+                )
+            except asyncio.CancelledError:
+                self.store.finish_step_attempt(
+                    step.id,
+                    AttemptOutcome.OUTCOME_UNKNOWN,
+                    error_code=SafeErrorCode.OUTCOME_UNKNOWN,
+                )
+                self.store.transition_task(task_id, TaskState.RECONCILIATION_REQUIRED)
+                raise
+            except Exception:
+                self.store.finish_step_attempt(
+                    step.id,
+                    AttemptOutcome.OUTCOME_UNKNOWN,
+                    error_code=SafeErrorCode.OUTCOME_UNKNOWN,
+                )
+            else:
+                self.store.finish_step_attempt(
+                    step.id, AttemptOutcome.SUCCEEDED, result=result
+                )
+            current = self.store.get_step(step.id)
+            if current.state is StepState.SUCCEEDED:
+                return self.store.transition_task(task_id, TaskState.COMPLETED)
+            if current.state is StepState.RECONCILIATION_REQUIRED:
+                return self.store.transition_task(task_id, TaskState.RECONCILIATION_REQUIRED)
+            return self.store.transition_task(task_id, TaskState.FAILED)
+        finally:
             _PROCESS_RUN_LOCK.release()
 
     def _persist_dispatch_denial(

@@ -130,6 +130,12 @@ class PairingCodeResponse(_ApiModel):
     expires_in_seconds: int = 300
 
 
+class OwnerCredentialRotationResponse(_ApiModel):
+    device: DeviceResponse
+    access_token: str = Field(min_length=1, max_length=256)
+    expires_at: datetime
+
+
 class DeviceListResponse(_ApiModel):
     devices: tuple[DeviceResponse, ...]
 
@@ -198,6 +204,26 @@ async def issue_pairing_code(
     response.headers["Pragma"] = "no-cache"
     code = service.issue_pairing_code(authenticated[0])
     return PairingCodeResponse(pairing_code=code.get_secret_value())
+
+
+@router.post(
+    "/owner-credential/rotate",
+    response_model=OwnerCredentialRotationResponse,
+    status_code=200,
+)
+async def rotate_owner_credential(
+    authenticated: Annotated[tuple[SecretStr, Device], Depends(authenticated_device)],
+    service: Annotated[DeviceService, Depends(device_service)],
+    response: Response,
+) -> OwnerCredentialRotationResponse:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    receipt = service.rotate_owner_credential(authenticated[0])
+    return OwnerCredentialRotationResponse(
+        device=DeviceResponse.from_device(receipt.device),
+        access_token=receipt.access_token.get_secret_value(),
+        expires_at=receipt.expires_at,
+    )
 
 
 @router.get("", response_model=DeviceListResponse)

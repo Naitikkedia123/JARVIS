@@ -29,6 +29,7 @@ class TaskState(StrEnum):
     READY = "ready"
     RUNNING = "running"
     PAUSED = "paused"
+    WAITING_APPROVAL = "waiting_approval"
     CANCELLING = "cancelling"
     RECONCILIATION_REQUIRED = "reconciliation_required"
     COMPLETED = "completed"
@@ -42,6 +43,7 @@ class StepState(StrEnum):
     RUNNING = "running"
     RETRY_WAIT = "retry_wait"
     PAUSED = "paused"
+    WAITING_APPROVAL = "waiting_approval"
     RECONCILIATION_REQUIRED = "reconciliation_required"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
@@ -84,6 +86,25 @@ class TaskEventType(StrEnum):
     RECONCILED = "reconciled"
 
 
+class ApprovalStatus(StrEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    DENIED = "denied"
+    EXPIRED = "expired"
+    REVOKED = "revoked"
+    CONSUMED = "consumed"
+
+
+class ApprovalAuditEventType(StrEnum):
+    REQUESTED = "requested"
+    APPROVED = "approved"
+    DENIED = "denied"
+    EXPIRED = "expired"
+    REVOKED = "revoked"
+    CONSUMED = "consumed"
+    DISPATCH_LINKED = "dispatch_linked"
+
+
 class EventMetadata(BaseModel):
     """Allowlisted audit fields; arbitrary text and exception messages are excluded."""
 
@@ -98,6 +119,91 @@ class EventMetadata(BaseModel):
     action_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     device_id: DeviceId | None = None
     authorization_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class ApprovalRequestRecord(BaseModel):
+    """Secret-free durable binding for one exact task action awaiting approval."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    request_id: UUID = Field(default_factory=uuid4)
+    task_id: OpaqueId
+    step_id: OpaqueId
+    requesting_device_id: DeviceId
+    owner_device_id: DeviceId
+    owner_credential_generation: int = Field(ge=1)
+    action_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    tool_definition_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: ApprovalStatus = ApprovalStatus.PENDING
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    expires_at: datetime
+    decided_at: datetime | None = None
+    decided_by_device_id: DeviceId | None = None
+    expired_at: datetime | None = None
+    revoked_at: datetime | None = None
+    revoked_by_device_id: DeviceId | None = None
+    consumed_at: datetime | None = None
+    consumed_by_device_id: DeviceId | None = None
+
+    @field_validator(
+        "created_at", "expires_at", "decided_at", "expired_at", "revoked_at", "consumed_at"
+    )
+    @classmethod
+    def timestamps_are_aware_utc(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _require_aware_utc(value)
+
+    @model_validator(mode="after")
+    def lifecycle_fields_match_status(self) -> ApprovalRequestRecord:
+        if self.expires_at <= self.created_at:
+            raise ValueError("Approval expiry must follow creation.")
+        if (self.decided_at is None) != (self.decided_by_device_id is None):
+            raise ValueError("Approval decision timestamp and actor must be paired.")
+        if (self.revoked_at is None) != (self.revoked_by_device_id is None):
+            raise ValueError("Approval revocation timestamp and actor must be paired.")
+        if (self.consumed_at is None) != (self.consumed_by_device_id is None):
+            raise ValueError("Approval consumption timestamp and actor must be paired.")
+        if self.status is ApprovalStatus.PENDING and any(
+            value is not None
+            for value in (self.decided_at, self.expired_at, self.revoked_at, self.consumed_at)
+        ):
+            raise ValueError("Pending approval cannot have lifecycle timestamps.")
+        if self.status in (ApprovalStatus.APPROVED, ApprovalStatus.DENIED) and (
+            self.decided_at is None
+        ):
+            raise ValueError("Decided approval requires decision provenance.")
+        if self.status is ApprovalStatus.EXPIRED and self.expired_at is None:
+            raise ValueError("Expired approval requires an expiry event timestamp.")
+        if self.status is ApprovalStatus.REVOKED and self.revoked_at is None:
+            raise ValueError("Revoked approval requires revocation provenance.")
+        if self.status is ApprovalStatus.CONSUMED and (
+            self.decided_at is None or self.consumed_at is None
+        ):
+            raise ValueError("Consumed approval must first have been approved.")
+        return self
+
+
+class ApprovalAuditEvent(BaseModel):
+    """Append-only, allowlisted approval provenance without action or token data."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    event_id: UUID = Field(default_factory=uuid4)
+    request_id: UUID
+    task_id: OpaqueId
+    step_id: OpaqueId
+    event_type: ApprovalAuditEventType
+    occurred_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    actor_device_id: DeviceId | None = None
+    owner_credential_generation: int = Field(ge=1)
+    action_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    tool_definition_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    attempt_id: OpaqueId | None = None
+    reason_code: str | None = Field(default=None, pattern=r"^[a-z0-9_.:-]{1,64}$")
+
+    @field_validator("occurred_at")
+    @classmethod
+    def timestamp_is_aware_utc(cls, value: datetime) -> datetime:
+        return _require_aware_utc(value)
 
 
 class AttemptAuthorization(BaseModel):
