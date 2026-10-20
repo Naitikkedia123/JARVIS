@@ -520,6 +520,38 @@ class DeviceStore:
             except sqlite3.Error as exc:
                 raise DeviceStoreError("Owner credential reservation could not be released.") from exc
 
+    @contextmanager
+    def reserve_task_device(
+        self, *, device_id: str, token_digest: str
+    ) -> Iterator[Device]:
+        """Hold an active task device credential stable through a TaskStore commit."""
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error as exc:
+            raise DeviceStoreError("Task device reservation is unavailable.") from exc
+        try:
+            device = self.validate_reserved_task_device(
+                device_id=device_id,
+                token_digest=token_digest,
+            )
+        except DeviceNotFoundError:
+            self._connection.rollback()
+            raise
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            self._connection.rollback()
+            raise DeviceStoreError("Task device reservation is unavailable.") from exc
+
+        try:
+            yield device
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            try:
+                self._connection.rollback()
+            except sqlite3.Error as exc:
+                raise DeviceStoreError("Task device reservation could not be released.") from exc
+
     def validate_reserved_task_device(self, *, device_id: str, token_digest: str) -> Device:
         """Validate a task device bearer and active role inside the held reservation."""
         if not self._connection.in_transaction:

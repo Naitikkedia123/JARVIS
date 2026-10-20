@@ -13,6 +13,7 @@ from pydantic import SecretStr
 
 from jarvis.devices.models import Device
 from jarvis.devices.service import DeviceAuthenticationError
+from jarvis.devices.store import DeviceStoreError
 from jarvis.memory.context import MemoryContextAssembler, TaskMemoryContext
 from jarvis.memory.errors import MemoryError
 from jarvis.memory.models import RetrievalContext
@@ -259,6 +260,41 @@ class TaskRuntime:
             task = self.store.transition_task(task_id, TaskState.CANCELLING)
         self._cancel_unstarted_steps(task_id)
         return self.store.transition_task(task_id, TaskState.CANCELLED)
+
+    def cancel_owned_task(self, task_id: str, access_token: SecretStr) -> Task:
+        """Cancel an owned task before execution using a reserved task credential."""
+        runner = self.authorized_runner
+        if runner is None or not isinstance(access_token, SecretStr):
+            raise TaskAuthorizationError("Task cancellation is not authorized.")
+        ownership = self.store.get_task_ownership(task_id)
+        if ownership is None:
+            raise EntityNotFoundError("Task was not found.")
+
+        try:
+            with runner.device_service.reserve_task_device(
+                access_token,
+                expected_device_id=ownership.device_id,
+            ) as device:
+                if device.id != ownership.device_id:
+                    raise TaskAuthorizationError("Task cancellation is not authorized.")
+
+                def validate_cancelling_device() -> None:
+                    current = runner.device_service.validate_reserved_task_device(
+                        access_token,
+                        expected_device_id=ownership.device_id,
+                    )
+                    if current.id != ownership.device_id:
+                        raise TaskAuthorizationError("Task cancellation is not authorized.")
+
+                return self.store.cancel_device_task(
+                    task_id,
+                    device.id,
+                    precommit_validation=validate_cancelling_device,
+                )
+        except DeviceAuthenticationError:
+            raise TaskAuthorizationError("Task cancellation is not authorized.") from None
+        except DeviceStoreError:
+            raise TaskStoreError("Task cancellation is temporarily unavailable.") from None
 
     def run_task(
         self, task_id: str, *, memory_access: RetrievalContext | None = None

@@ -789,6 +789,145 @@ class TaskStore:
             raise EntityNotFoundError("Task was not found.")
         return self._load_task_plan(task_id)
 
+    def cancel_device_task(
+        self,
+        task_id: str,
+        device_id: str,
+        *,
+        precommit_validation: Callable[[], None],
+    ) -> Task:
+        """Cancel an owned task only while it has no execution attempt.
+
+        The caller holds the task device's DeviceStore reservation. This
+        transaction is the cancellation/start linearization point.
+        """
+        with self._transaction():
+            row = self._connection.execute(
+                """SELECT tasks.goal_id, tasks.state,
+                    task_submissions.device_id AS task_owner_device_id
+                    FROM tasks LEFT JOIN task_submissions ON task_submissions.task_id = tasks.id
+                    WHERE tasks.id = ?""",
+                (task_id,),
+            ).fetchone()
+            if row is None or row["task_owner_device_id"] != device_id:
+                raise EntityNotFoundError("Task was not found.")
+
+            attempts = self._connection.execute(
+                """SELECT 1 FROM step_attempts
+                    JOIN steps ON steps.id = step_attempts.step_id
+                    WHERE steps.task_id = ? LIMIT 1""",
+                (task_id,),
+            ).fetchone()
+            if attempts is not None:
+                raise InvalidTransitionError("Task execution has already started.")
+
+            current = TaskState(row["state"])
+            step_rows = self._connection.execute(
+                "SELECT id, state, attempt_count FROM steps WHERE task_id = ? ORDER BY rowid",
+                (task_id,),
+            ).fetchall()
+            step_states = tuple(StepState(item["state"]) for item in step_rows)
+            if not step_rows or any(item["attempt_count"] != 0 for item in step_rows):
+                raise InvalidTransitionError("Task execution has already started.")
+
+            if current is TaskState.READY:
+                eligible_steps = {StepState.PENDING, StepState.READY}
+            elif current is TaskState.WAITING_APPROVAL:
+                eligible_steps = {
+                    StepState.PENDING,
+                    StepState.READY,
+                    StepState.WAITING_APPROVAL,
+                }
+                if StepState.WAITING_APPROVAL not in step_states:
+                    raise InvalidTransitionError("Task is unavailable for cancellation.")
+            else:
+                raise InvalidTransitionError("Task execution has already started.")
+
+            if any(state not in eligible_steps for state in step_states):
+                raise InvalidTransitionError("Task execution has already started.")
+            validate_task_transition(current, TaskState.CANCELLED)
+            for state in step_states:
+                validate_step_transition(state, StepState.CANCELLED)
+
+            now = self._now()
+            cursor = self._connection.execute(
+                """UPDATE tasks SET state = ?, updated_at = ?
+                    WHERE id = ? AND state = ? AND NOT EXISTS (
+                        SELECT 1 FROM step_attempts
+                        JOIN steps ON steps.id = step_attempts.step_id
+                        WHERE steps.task_id = tasks.id
+                    )""",
+                (TaskState.CANCELLED.value, now, task_id, current.value),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidTransitionError("Task execution has already started.")
+
+            for step_row, state in zip(step_rows, step_states, strict=True):
+                step_cursor = self._connection.execute(
+                    """UPDATE steps SET state = ?, updated_at = ?
+                        WHERE id = ? AND task_id = ? AND state = ? AND attempt_count = 0""",
+                    (
+                        StepState.CANCELLED.value,
+                        now,
+                        step_row["id"],
+                        task_id,
+                        state.value,
+                    ),
+                )
+                if step_cursor.rowcount != 1:
+                    raise InvalidTransitionError("Task execution has already started.")
+
+            self._append_event(
+                event_type=TaskEventType.STATE_CHANGED,
+                goal_id=row["goal_id"],
+                task_id=task_id,
+                from_state=current.value,
+                to_state=TaskState.CANCELLED.value,
+                metadata=EventMetadata(device_id=device_id),
+            )
+            for step_row, state in zip(step_rows, step_states, strict=True):
+                self._append_event(
+                    event_type=TaskEventType.STATE_CHANGED,
+                    goal_id=row["goal_id"],
+                    task_id=task_id,
+                    step_id=step_row["id"],
+                    from_state=state.value,
+                    to_state=StepState.CANCELLED.value,
+                    metadata=EventMetadata(device_id=device_id),
+                )
+
+            approval_rows = self._connection.execute(
+                """SELECT * FROM approval_requests WHERE task_id = ?
+                    AND status IN ('pending', 'approved') ORDER BY created_at, request_id""",
+                (task_id,),
+            ).fetchall()
+            for approval_row in approval_rows:
+                request = self._approval_request_from_row(approval_row)
+                updated = request.model_copy(
+                    update={
+                        "status": ApprovalStatus.REVOKED,
+                        "revoked_at": datetime.fromisoformat(now),
+                        "revoked_by_device_id": device_id,
+                    }
+                )
+                approval_cursor = self._connection.execute(
+                    """UPDATE approval_requests SET status = 'revoked', revoked_at = ?,
+                        revoked_by_device_id = ? WHERE request_id = ?
+                        AND status IN ('pending', 'approved')""",
+                    (now, device_id, str(request.request_id)),
+                )
+                if approval_cursor.rowcount != 1:
+                    raise InvalidTransitionError("Approval request is unavailable.")
+                self._append_approval_audit_event(
+                    updated,
+                    event_type=ApprovalAuditEventType.REVOKED,
+                    actor_device_id=device_id,
+                    reason_code="task_cancelled",
+                )
+
+            precommit_validation()
+        return self.get_task(task_id)
+
     @staticmethod
     def _approval_request_from_row(row: sqlite3.Row) -> ApprovalRequestRecord:
         data = {
