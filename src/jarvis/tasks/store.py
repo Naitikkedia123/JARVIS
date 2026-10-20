@@ -29,6 +29,10 @@ from jarvis.tasks.errors import (
     TaskSubmissionConflictError,
 )
 from jarvis.tasks.models import (
+    ApprovalAuditEvent,
+    ApprovalAuditEventType,
+    ApprovalRequestRecord,
+    ApprovalStatus,
     AttemptAuthorization,
     AttemptAuthorizationBinding,
     AttemptDenial,
@@ -57,7 +61,7 @@ from jarvis.tasks.state import (
 )
 
 Clock = Callable[[], datetime]
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 _SCHEMA_V1 = (
     """CREATE TABLE goals (
@@ -197,6 +201,109 @@ _SCHEMA_V5 = (
 
 _SCHEMA_V6 = ("ALTER TABLE step_attempts ADD COLUMN dispatch_claimed_at TEXT",)
 
+_SCHEMA_V7_APPROVALS = (
+    """CREATE TABLE approval_requests (
+        request_id TEXT PRIMARY KEY CHECK(length(request_id) = 36),
+        task_id TEXT NOT NULL,
+        step_id TEXT NOT NULL,
+        requesting_device_id TEXT NOT NULL CHECK(length(requesting_device_id) = 32),
+        owner_device_id TEXT NOT NULL CHECK(length(owner_device_id) = 32),
+        owner_credential_generation INTEGER NOT NULL CHECK(owner_credential_generation >= 1),
+        action_digest TEXT NOT NULL CHECK(
+            length(action_digest) = 64 AND action_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        tool_definition_digest TEXT NOT NULL CHECK(
+            length(tool_definition_digest) = 64
+                AND tool_definition_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        status TEXT NOT NULL CHECK(status IN (
+            'pending','approved','denied','expired','revoked','consumed'
+        )),
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        decided_at TEXT,
+        decided_by_device_id TEXT CHECK(
+            decided_by_device_id IS NULL OR length(decided_by_device_id) = 32
+        ),
+        expired_at TEXT,
+        revoked_at TEXT,
+        revoked_by_device_id TEXT CHECK(
+            revoked_by_device_id IS NULL OR length(revoked_by_device_id) = 32
+        ),
+        consumed_at TEXT,
+        consumed_by_device_id TEXT CHECK(
+            consumed_by_device_id IS NULL OR length(consumed_by_device_id) = 32
+        ),
+        UNIQUE(request_id, task_id, step_id),
+        CHECK(expires_at > created_at),
+        CHECK((decided_at IS NULL) = (decided_by_device_id IS NULL)),
+        CHECK((revoked_at IS NULL) = (revoked_by_device_id IS NULL)),
+        CHECK((consumed_at IS NULL) = (consumed_by_device_id IS NULL)),
+        CHECK(
+            (status = 'pending' AND decided_at IS NULL AND expired_at IS NULL
+                AND revoked_at IS NULL AND consumed_at IS NULL)
+            OR (status IN ('approved','denied') AND decided_at IS NOT NULL
+                AND expired_at IS NULL AND revoked_at IS NULL AND consumed_at IS NULL)
+            OR (status = 'expired' AND expired_at IS NOT NULL
+                AND revoked_at IS NULL AND consumed_at IS NULL)
+            OR (status = 'revoked' AND revoked_at IS NOT NULL
+                AND expired_at IS NULL AND consumed_at IS NULL)
+            OR (status = 'consumed' AND decided_at IS NOT NULL
+                AND consumed_at IS NOT NULL AND expired_at IS NULL AND revoked_at IS NULL)
+        ),
+        FOREIGN KEY(task_id, step_id) REFERENCES steps(task_id, id) ON DELETE RESTRICT
+    )""",
+    """CREATE UNIQUE INDEX approval_requests_one_active_per_step
+        ON approval_requests(task_id, step_id) WHERE status IN ('pending','approved')""",
+    """CREATE TABLE approval_audit_events (
+        event_id TEXT PRIMARY KEY CHECK(length(event_id) = 36),
+        request_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        step_id TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK(event_type IN (
+            'requested','approved','denied','expired','revoked','consumed','dispatch_linked'
+        )),
+        occurred_at TEXT NOT NULL,
+        actor_device_id TEXT CHECK(actor_device_id IS NULL OR length(actor_device_id) = 32),
+        owner_credential_generation INTEGER NOT NULL CHECK(owner_credential_generation >= 1),
+        action_digest TEXT NOT NULL CHECK(
+            length(action_digest) = 64 AND action_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        tool_definition_digest TEXT NOT NULL CHECK(
+            length(tool_definition_digest) = 64
+                AND tool_definition_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        attempt_id TEXT,
+        reason_code TEXT CHECK(reason_code IS NULL OR
+            (length(reason_code) BETWEEN 1 AND 64 AND reason_code NOT GLOB '*[^a-z0-9_.:-]*')),
+        UNIQUE(request_id, event_type),
+        FOREIGN KEY(request_id, task_id, step_id)
+            REFERENCES approval_requests(request_id, task_id, step_id) ON DELETE RESTRICT
+    )""",
+    "CREATE INDEX approval_audit_events_task_idx ON approval_audit_events(task_id, occurred_at)",
+    """CREATE TRIGGER approval_requests_valid_status_transition
+        BEFORE UPDATE OF status ON approval_requests
+        WHEN NOT (
+            (OLD.status = 'pending' AND NEW.status IN ('approved','denied','expired','revoked'))
+            OR (OLD.status = 'approved' AND NEW.status IN ('expired','revoked','consumed'))
+        )
+        BEGIN SELECT RAISE(ABORT, 'invalid approval status transition'); END""",
+    """CREATE TRIGGER approval_requests_binding_immutable
+        BEFORE UPDATE OF request_id, task_id, step_id, requesting_device_id,
+            owner_device_id, owner_credential_generation, action_digest,
+            tool_definition_digest, created_at, expires_at ON approval_requests
+        BEGIN SELECT RAISE(ABORT, 'approval binding is immutable'); END""",
+    """CREATE TRIGGER approval_requests_no_delete
+        BEFORE DELETE ON approval_requests
+        BEGIN SELECT RAISE(ABORT, 'approval requests are retained'); END""",
+    """CREATE TRIGGER approval_audit_no_update
+        BEFORE UPDATE ON approval_audit_events
+        BEGIN SELECT RAISE(ABORT, 'approval audit events are append-only'); END""",
+    """CREATE TRIGGER approval_audit_no_delete
+        BEFORE DELETE ON approval_audit_events
+        BEGIN SELECT RAISE(ABORT, 'approval audit events are append-only'); END""",
+)
+
 
 def _json_dumps(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True)
@@ -321,12 +428,104 @@ class TaskStore:
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (6, self._now()),
                 )
+            applied.add(6)
+        if 7 not in applied:
+            self._apply_v7()
+
+    def _apply_v7(self) -> None:
+        """Add approval persistence and reserve explicit waiting task states.
+
+        SQLite cannot widen the existing state CHECK constraints in place. The
+        table rebuild runs as one DDL transaction with foreign-key enforcement
+        temporarily disabled; a full foreign-key check runs before commit.
+        """
+        self._connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            with self._transaction():
+                self._connection.execute(
+                    """CREATE TABLE tasks_v7 (
+                        id TEXT PRIMARY KEY,
+                        goal_id TEXT NOT NULL,
+                        title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 200),
+                        state TEXT NOT NULL CHECK(state IN ('ready','running','paused',
+                            'waiting_approval','cancelling','reconciliation_required',
+                            'completed','failed','cancelled')),
+                        planner_version TEXT NOT NULL
+                            CHECK(length(planner_version) BETWEEN 1 AND 64),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(id, goal_id),
+                        FOREIGN KEY(goal_id) REFERENCES goals(id) ON DELETE CASCADE
+                    )"""
+                )
+                self._connection.execute(
+                    """INSERT INTO tasks_v7
+                        (id, goal_id, title, state, planner_version, created_at, updated_at)
+                        SELECT id, goal_id, title, state, planner_version, created_at, updated_at
+                        FROM tasks"""
+                )
+                self._connection.execute("DROP TABLE tasks")
+                self._connection.execute("ALTER TABLE tasks_v7 RENAME TO tasks")
+
+                self._connection.execute(
+                    """CREATE TABLE steps_v7 (
+                        id TEXT PRIMARY KEY,
+                        task_id TEXT NOT NULL,
+                        title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 200),
+                        state TEXT NOT NULL CHECK(state IN ('pending','ready','running',
+                            'retry_wait','paused','waiting_approval','reconciliation_required',
+                            'succeeded','failed','cancelled')),
+                        replay_safety TEXT NOT NULL
+                            CHECK(replay_safety IN ('pure','idempotent','non_idempotent')),
+                        idempotency_key TEXT,
+                        attempt_limit INTEGER NOT NULL CHECK(attempt_limit BETWEEN 1 AND 10),
+                        attempt_count INTEGER NOT NULL
+                            CHECK(attempt_count BETWEEN 0 AND attempt_limit),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        result_json TEXT,
+                        action_json TEXT,
+                        UNIQUE(task_id, id),
+                        CHECK(replay_safety != 'idempotent' OR idempotency_key IS NOT NULL),
+                        CHECK(state != 'running' OR attempt_count > 0),
+                        CHECK(state != 'reconciliation_required' OR attempt_count > 0),
+                        FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+                    )"""
+                )
+                self._connection.execute(
+                    """INSERT INTO steps_v7
+                        (id, task_id, title, state, replay_safety, idempotency_key,
+                         attempt_limit, attempt_count, created_at, updated_at,
+                         result_json, action_json)
+                        SELECT id, task_id, title, state, replay_safety, idempotency_key,
+                            attempt_limit, attempt_count, created_at, updated_at,
+                            result_json, action_json
+                        FROM steps"""
+                )
+                self._connection.execute("DROP TABLE steps")
+                self._connection.execute("ALTER TABLE steps_v7 RENAME TO steps")
+
+                for statement in _SCHEMA_V7_APPROVALS:
+                    self._connection.execute(statement)
+                violations = self._connection.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise TaskStoreError("Approval schema migration violates task references.")
+                self._connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (7, self._now()),
+                )
+        finally:
+            self._connection.execute("PRAGMA foreign_keys = ON")
 
     def _now(self) -> str:
         try:
             return _timestamp(self._clock())
         except (TypeError, ValueError):
             raise TaskStoreError("The task store clock must return a timezone-aware timestamp.") from None
+
+    def current_time(self) -> datetime:
+        """Return the validated store clock for related approval lifecycle checks."""
+        return datetime.fromisoformat(self._now())
 
     def _append_event(
         self,
@@ -590,6 +789,572 @@ class TaskStore:
             raise EntityNotFoundError("Task was not found.")
         return self._load_task_plan(task_id)
 
+    @staticmethod
+    def _approval_request_from_row(row: sqlite3.Row) -> ApprovalRequestRecord:
+        data = {
+            name: value
+            for name, value in dict(row).items()
+            if name in ApprovalRequestRecord.model_fields
+        }
+        data["request_id"] = UUID(data["request_id"])
+        for name in (
+            "created_at", "expires_at", "decided_at", "expired_at", "revoked_at", "consumed_at"
+        ):
+            if data[name] is not None:
+                data[name] = datetime.fromisoformat(data[name])
+        return ApprovalRequestRecord.model_validate(data)
+
+    @staticmethod
+    def _approval_event_from_row(row: sqlite3.Row) -> ApprovalAuditEvent:
+        data = dict(row)
+        data["event_id"] = UUID(data["event_id"])
+        data["request_id"] = UUID(data["request_id"])
+        data["occurred_at"] = datetime.fromisoformat(data["occurred_at"])
+        return ApprovalAuditEvent.model_validate(data)
+
+    def create_approval_request(self, request: ApprovalRequestRecord) -> ApprovalRequestRecord:
+        """Persist a request and move its task and step to waiting atomically."""
+        if request.status is not ApprovalStatus.PENDING:
+            raise TaskStoreError("A new approval request must be pending.")
+        now = datetime.fromisoformat(self._now())
+        if request.created_at > now or request.expires_at <= now:
+            raise TaskStoreError("Approval request timestamps are not current.")
+        with self._transaction():
+            step = self._connection.execute(
+                """SELECT steps.task_id, steps.action_json, steps.state AS step_state,
+                    tasks.state AS task_state, tasks.goal_id, task_submissions.device_id
+                    FROM steps LEFT JOIN task_submissions
+                        ON task_submissions.task_id = steps.task_id
+                    JOIN tasks ON tasks.id = steps.task_id
+                    WHERE steps.id = ?""",
+                (request.step_id,),
+            ).fetchone()
+            if step is None or step["task_id"] != request.task_id:
+                raise EntityNotFoundError("Approval task step was not found.")
+            action = self._action_from_json(step["action_json"])
+            if (
+                action is None
+                or action.digest() != request.action_digest
+                or step["device_id"] != request.requesting_device_id
+                or step["task_state"] != TaskState.READY.value
+                or step["step_state"] not in (StepState.PENDING.value, StepState.READY.value)
+            ):
+                raise TaskStoreError("Approval request does not match the stored task action.")
+            incomplete = self._connection.execute(
+                """SELECT 1 FROM step_dependencies AS dependency
+                    JOIN steps AS prerequisite ON prerequisite.id = dependency.depends_on_step_id
+                    WHERE dependency.step_id = ? AND prerequisite.state != 'succeeded' LIMIT 1""",
+                (request.step_id,),
+            ).fetchone()
+            if incomplete is not None:
+                raise DependencyNotSatisfiedError("Approval cannot wait on an incomplete dependency.")
+            now_text = self._now()
+            self._connection.execute(
+                """INSERT INTO approval_requests
+                    (request_id, task_id, step_id, requesting_device_id, owner_device_id,
+                     owner_credential_generation, action_digest, tool_definition_digest,
+                     status, created_at, expires_at, decided_at, decided_by_device_id,
+                     expired_at, revoked_at, revoked_by_device_id, consumed_at,
+                     consumed_by_device_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL,
+                        NULL, NULL, NULL)""",
+                (
+                    str(request.request_id), request.task_id, request.step_id,
+                    request.requesting_device_id, request.owner_device_id,
+                    request.owner_credential_generation, request.action_digest,
+                    request.tool_definition_digest, request.status.value,
+                    _timestamp(request.created_at), _timestamp(request.expires_at),
+                ),
+            )
+            self._append_approval_audit_event(
+                request,
+                event_type=ApprovalAuditEventType.REQUESTED,
+                actor_device_id=request.requesting_device_id,
+            )
+            self._connection.execute(
+                "UPDATE tasks SET state = ?, updated_at = ? WHERE id = ? AND state = ?",
+                (TaskState.WAITING_APPROVAL.value, now_text, request.task_id, TaskState.READY.value),
+            )
+            self._connection.execute(
+                "UPDATE steps SET state = ?, updated_at = ? WHERE id = ? AND state IN (?, ?)",
+                (
+                    StepState.WAITING_APPROVAL.value,
+                    now_text,
+                    request.step_id,
+                    StepState.PENDING.value,
+                    StepState.READY.value,
+                ),
+            )
+            self._append_event(
+                event_type=TaskEventType.STATE_CHANGED,
+                goal_id=step["goal_id"],
+                task_id=request.task_id,
+                from_state=TaskState.READY.value,
+                to_state=TaskState.WAITING_APPROVAL.value,
+                metadata=EventMetadata(
+                    action_digest=request.action_digest,
+                    device_id=request.requesting_device_id,
+                ),
+            )
+            self._append_event(
+                event_type=TaskEventType.STATE_CHANGED,
+                goal_id=step["goal_id"],
+                task_id=request.task_id,
+                step_id=request.step_id,
+                from_state=step["step_state"],
+                to_state=StepState.WAITING_APPROVAL.value,
+                metadata=EventMetadata(
+                    action_digest=request.action_digest,
+                    device_id=request.requesting_device_id,
+                ),
+            )
+        return self.get_approval_request(request.request_id)
+
+    def decide_approval_request(
+        self,
+        request_id: UUID | str,
+        *,
+        owner_device_id: str,
+        owner_credential_generation: int,
+        action_digest: str,
+        tool_definition_digest: str,
+        approve: bool,
+        precommit_validation: Callable[[], None],
+    ) -> ApprovalRequestRecord:
+        """Record one authenticated owner's decision or terminally invalidate it."""
+        parsed_id = self._parse_approval_id(request_id)
+        target = ApprovalStatus.APPROVED if approve else ApprovalStatus.DENIED
+        with self._transaction():
+            row = self._approval_context(parsed_id)
+            if row is None or row["owner_device_id"] != owner_device_id:
+                raise EntityNotFoundError("Approval request was not found.")
+            request = self._approval_request_from_row(row)
+            if request.status is not ApprovalStatus.PENDING:
+                raise InvalidTransitionError("Approval request is unavailable.")
+            step_action = self._action_from_json(row["action_json"])
+            now = datetime.fromisoformat(self._now())
+            invalid_reason: str | None = None
+            terminal = target
+            if request.owner_credential_generation != owner_credential_generation:
+                terminal = ApprovalStatus.REVOKED
+                invalid_reason = "credential_generation_changed"
+            elif (
+                step_action is None
+                or step_action.digest() != request.action_digest
+                or row["task_owner_device_id"] != request.requesting_device_id
+                or row["task_state"] != TaskState.WAITING_APPROVAL.value
+                or row["step_state"] != StepState.WAITING_APPROVAL.value
+                or action_digest != request.action_digest
+                or tool_definition_digest != request.tool_definition_digest
+            ):
+                terminal = ApprovalStatus.REVOKED
+                invalid_reason = "binding_changed"
+            elif now >= request.expires_at:
+                terminal = ApprovalStatus.EXPIRED
+                invalid_reason = "expired"
+
+            values = request.model_dump(mode="python")
+            values["status"] = terminal
+            event_type = ApprovalAuditEventType(terminal.value)
+            actor_device_id: str | None = owner_device_id
+            if terminal in (ApprovalStatus.APPROVED, ApprovalStatus.DENIED):
+                values["decided_at"] = now
+                values["decided_by_device_id"] = owner_device_id
+            elif terminal is ApprovalStatus.EXPIRED:
+                values["expired_at"] = now
+                actor_device_id = None
+            elif terminal is ApprovalStatus.REVOKED:
+                values["revoked_at"] = now
+                values["revoked_by_device_id"] = owner_device_id
+            updated = ApprovalRequestRecord.model_validate(values)
+            cursor = self._connection.execute(
+                """UPDATE approval_requests SET status = ?, decided_at = ?,
+                    decided_by_device_id = ?, expired_at = ?, revoked_at = ?,
+                    revoked_by_device_id = ? WHERE request_id = ? AND status = 'pending'""",
+                (
+                    terminal.value,
+                    None if updated.decided_at is None else _timestamp(updated.decided_at),
+                    updated.decided_by_device_id,
+                    None if updated.expired_at is None else _timestamp(updated.expired_at),
+                    None if updated.revoked_at is None else _timestamp(updated.revoked_at),
+                    updated.revoked_by_device_id,
+                    str(parsed_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidTransitionError("Approval request is unavailable.")
+            self._append_approval_audit_event(
+                updated,
+                event_type=event_type,
+                actor_device_id=actor_device_id,
+                reason_code=invalid_reason,
+            )
+            if terminal in (ApprovalStatus.DENIED, ApprovalStatus.EXPIRED, ApprovalStatus.REVOKED):
+                self._fail_waiting_approval_tx(row, request, terminal)
+            precommit_validation()
+        return self.get_approval_request(parsed_id)
+
+    def consume_approval_and_start_attempt(
+        self,
+        request_id: UUID | str,
+        *,
+        requesting_device_id: str,
+        owner_credential_generation: int,
+        action_digest: str,
+        tool_definition_digest: str,
+        authorization: AttemptAuthorization,
+        precommit_validation: Callable[[], None],
+    ) -> StepAttempt:
+        """Consume approval and persist running attempt plus dispatch claim atomically."""
+        parsed_id = self._parse_approval_id(request_id)
+        with self._transaction():
+            row = self._approval_context(parsed_id)
+            if row is None or row["requesting_device_id"] != requesting_device_id:
+                raise EntityNotFoundError("Task was not found.")
+            request = self._approval_request_from_row(row)
+            step = self._step_from_context(self._step_context(request.step_id))
+            action = step.action
+            now = datetime.fromisoformat(self._now())
+            if (
+                request.status is not ApprovalStatus.APPROVED
+                or row["task_state"] != TaskState.WAITING_APPROVAL.value
+                or row["step_state"] != StepState.WAITING_APPROVAL.value
+                or request.expires_at <= now
+                or request.owner_credential_generation != owner_credential_generation
+                or row["task_owner_device_id"] != requesting_device_id
+                or action is None
+                or action.digest() != request.action_digest
+                or request.action_digest != action_digest
+                or request.tool_definition_digest != tool_definition_digest
+                or authorization.device_id != requesting_device_id
+                or authorization.action_digest != request.action_digest
+            ):
+                raise InvalidTransitionError("Approved task is unavailable for resume.")
+            if step.attempt_count >= step.attempt_limit:
+                raise RetryLimitExceededError("Step attempt limit has been reached.")
+            incomplete = self._connection.execute(
+                """SELECT 1 FROM step_dependencies AS dependency
+                    JOIN steps AS prerequisite ON prerequisite.id = dependency.depends_on_step_id
+                    WHERE dependency.step_id = ? AND prerequisite.state != 'succeeded' LIMIT 1""",
+                (request.step_id,),
+            ).fetchone()
+            if incomplete is not None:
+                raise DependencyNotSatisfiedError("Task dependencies are not satisfied.")
+            attempt_number = step.attempt_count + 1
+            attempt_id = uuid4().hex
+            now_text = _timestamp(now)
+            binding = AttemptAuthorizationBinding(
+                task_id=request.task_id,
+                step_id=request.step_id,
+                attempt_id=attempt_id,
+                attempt_number=attempt_number,
+                device_id=authorization.device_id,
+                action_digest=authorization.action_digest,
+                authorization_fingerprint=authorization.authorization_fingerprint,
+            )
+            attempt = StepAttempt(
+                id=attempt_id,
+                step_id=request.step_id,
+                attempt_number=attempt_number,
+                outcome=AttemptOutcome.RUNNING,
+                replay_safety=step.replay_safety,
+                idempotency_key=step.idempotency_key,
+                started_at=now,
+                dispatch_claimed_at=now,
+            )
+            self._connection.execute(
+                """UPDATE approval_requests SET status = 'consumed', consumed_at = ?,
+                    consumed_by_device_id = ? WHERE request_id = ? AND status = 'approved'""",
+                (now_text, requesting_device_id, str(parsed_id)),
+            )
+            self._connection.execute(
+                """INSERT INTO step_attempts
+                    (id, step_id, attempt_number, outcome, replay_safety, idempotency_key,
+                     error_code, started_at, finished_at, dispatch_claimed_at)
+                    VALUES (?, ?, ?, 'running', ?, ?, NULL, ?, NULL, ?)""",
+                (
+                    attempt_id,
+                    request.step_id,
+                    attempt_number,
+                    step.replay_safety.value,
+                    step.idempotency_key,
+                    now_text,
+                    now_text,
+                ),
+            )
+            self._connection.execute(
+                """INSERT INTO attempt_authorizations
+                    (attempt_id, task_id, step_id, action_digest, device_id,
+                     authorization_fingerprint) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    attempt_id,
+                    request.task_id,
+                    request.step_id,
+                    binding.action_digest,
+                    binding.device_id,
+                    binding.authorization_fingerprint,
+                ),
+            )
+            self._connection.execute(
+                "UPDATE tasks SET state = ?, updated_at = ? WHERE id = ? AND state = ?",
+                (
+                    TaskState.RUNNING.value,
+                    now_text,
+                    request.task_id,
+                    TaskState.WAITING_APPROVAL.value,
+                ),
+            )
+            self._connection.execute(
+                """UPDATE steps SET state = ?, attempt_count = ?, updated_at = ?
+                    WHERE id = ? AND state = ?""",
+                (
+                    StepState.RUNNING.value,
+                    attempt_number,
+                    now_text,
+                    request.step_id,
+                    StepState.WAITING_APPROVAL.value,
+                ),
+            )
+            self._append_event(
+                event_type=TaskEventType.STATE_CHANGED,
+                goal_id=row["goal_id"],
+                task_id=request.task_id,
+                from_state=TaskState.WAITING_APPROVAL.value,
+                to_state=TaskState.RUNNING.value,
+                metadata=EventMetadata(
+                    attempt_number=attempt_number,
+                    replay_safety=step.replay_safety,
+                    attempt_id=attempt_id,
+                    action_digest=request.action_digest,
+                    device_id=requesting_device_id,
+                    authorization_fingerprint=authorization.authorization_fingerprint,
+                ),
+            )
+            self._append_event(
+                event_type=TaskEventType.ATTEMPT_STARTED,
+                goal_id=row["goal_id"],
+                task_id=request.task_id,
+                step_id=request.step_id,
+                from_state=StepState.WAITING_APPROVAL.value,
+                to_state=StepState.RUNNING.value,
+                metadata=EventMetadata(
+                    attempt_number=attempt_number,
+                    replay_safety=step.replay_safety,
+                    attempt_id=attempt_id,
+                    action_digest=request.action_digest,
+                    device_id=requesting_device_id,
+                    authorization_fingerprint=authorization.authorization_fingerprint,
+                ),
+            )
+            self._append_approval_audit_event(
+                request.model_copy(
+                    update={
+                        "status": ApprovalStatus.CONSUMED,
+                        "consumed_at": now,
+                        "consumed_by_device_id": requesting_device_id,
+                    }
+                ),
+                event_type=ApprovalAuditEventType.CONSUMED,
+                actor_device_id=requesting_device_id,
+                attempt_id=attempt_id,
+            )
+            precommit_validation()
+        return attempt.model_copy(update={"authorization_binding": binding})
+
+    def invalidate_approved_approval(
+        self, request_id: UUID | str, *, reason_code: str
+    ) -> ApprovalRequestRecord:
+        """Terminally expire or revoke an unusable approval and fail its waiter."""
+        parsed_id = self._parse_approval_id(request_id)
+        with self._transaction():
+            row = self._approval_context(parsed_id)
+            if row is None:
+                raise EntityNotFoundError("Approval request was not found.")
+            request = self._approval_request_from_row(row)
+            if request.status is not ApprovalStatus.APPROVED:
+                raise InvalidTransitionError("Approval request is unavailable.")
+            expired = self.current_time() >= request.expires_at
+            self._revoke_approved_approval_tx(
+                row,
+                request,
+                owner_device_id=request.owner_device_id,
+                reason_code="expired" if expired else reason_code,
+                expired=expired,
+            )
+        return self.get_approval_request(parsed_id)
+
+    @staticmethod
+    def _parse_approval_id(request_id: UUID | str) -> UUID:
+        try:
+            return request_id if isinstance(request_id, UUID) else UUID(request_id)
+        except (TypeError, ValueError, AttributeError):
+            raise EntityNotFoundError("Approval request was not found.") from None
+
+    def _approval_context(self, request_id: UUID) -> sqlite3.Row | None:
+        return self._connection.execute(
+            """SELECT approval_requests.*, tasks.state AS task_state, tasks.goal_id,
+                steps.state AS step_state, steps.action_json,
+                task_submissions.device_id AS task_owner_device_id
+                FROM approval_requests
+                JOIN tasks ON tasks.id = approval_requests.task_id
+                JOIN steps ON steps.id = approval_requests.step_id
+                LEFT JOIN task_submissions ON task_submissions.task_id = tasks.id
+                WHERE approval_requests.request_id = ?""",
+            (str(request_id),),
+        ).fetchone()
+
+    def _fail_waiting_approval_tx(
+        self,
+        row: sqlite3.Row,
+        request: ApprovalRequestRecord,
+        terminal: ApprovalStatus,
+    ) -> None:
+        now = self._now()
+        self._connection.execute(
+            "UPDATE tasks SET state = 'failed', updated_at = ? WHERE id = ? AND state = 'waiting_approval'",
+            (now, request.task_id),
+        )
+        self._connection.execute(
+            "UPDATE steps SET state = 'failed', updated_at = ? WHERE id = ? AND state = 'waiting_approval'",
+            (now, request.step_id),
+        )
+        self._append_event(
+            event_type=TaskEventType.STATE_CHANGED,
+            goal_id=row["goal_id"],
+            task_id=request.task_id,
+            from_state=TaskState.WAITING_APPROVAL.value,
+            to_state=TaskState.FAILED.value,
+        )
+        self._append_event(
+            event_type=TaskEventType.STATE_CHANGED,
+            goal_id=row["goal_id"],
+            task_id=request.task_id,
+            step_id=request.step_id,
+            from_state=StepState.WAITING_APPROVAL.value,
+            to_state=StepState.FAILED.value,
+        )
+
+    def _revoke_approved_approval_tx(
+        self,
+        row: sqlite3.Row,
+        request: ApprovalRequestRecord,
+        *,
+        owner_device_id: str,
+        reason_code: str,
+        expired: bool,
+    ) -> None:
+        now = datetime.fromisoformat(self._now())
+        status = ApprovalStatus.EXPIRED if expired else ApprovalStatus.REVOKED
+        values = request.model_dump(mode="python")
+        values["status"] = status
+        if expired:
+            values["expired_at"] = now
+        else:
+            values["revoked_at"] = now
+            values["revoked_by_device_id"] = owner_device_id
+        updated = ApprovalRequestRecord.model_validate(values)
+        self._connection.execute(
+            """UPDATE approval_requests SET status = ?, expired_at = ?, revoked_at = ?,
+                revoked_by_device_id = ? WHERE request_id = ? AND status = 'approved'""",
+            (
+                status.value,
+                None if updated.expired_at is None else _timestamp(updated.expired_at),
+                None if updated.revoked_at is None else _timestamp(updated.revoked_at),
+                updated.revoked_by_device_id,
+                str(request.request_id),
+            ),
+        )
+        self._append_approval_audit_event(
+            updated,
+            event_type=ApprovalAuditEventType(status.value),
+            actor_device_id=owner_device_id,
+            reason_code=reason_code,
+        )
+        self._fail_waiting_approval_tx(row, request, status)
+
+    def get_approval_request(self, request_id: UUID | str) -> ApprovalRequestRecord:
+        try:
+            parsed_id = request_id if isinstance(request_id, UUID) else UUID(request_id)
+        except (TypeError, ValueError, AttributeError):
+            raise EntityNotFoundError("Approval request was not found.") from None
+        row = self._connection.execute(
+            "SELECT * FROM approval_requests WHERE request_id = ?", (str(parsed_id),)
+        ).fetchone()
+        if row is None:
+            raise EntityNotFoundError("Approval request was not found.")
+        try:
+            return self._approval_request_from_row(row)
+        except (ValidationError, TypeError, ValueError):
+            raise TaskStoreError("Stored approval request is invalid.") from None
+
+    def list_approval_requests(self, task_id: str) -> tuple[ApprovalRequestRecord, ...]:
+        rows = self._connection.execute(
+            "SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at, request_id",
+            (task_id,),
+        ).fetchall()
+        try:
+            return tuple(self._approval_request_from_row(row) for row in rows)
+        except (ValidationError, TypeError, ValueError):
+            raise TaskStoreError("Stored approval request is invalid.") from None
+
+    def _append_approval_audit_event(
+        self,
+        request: ApprovalRequestRecord,
+        *,
+        event_type: ApprovalAuditEventType,
+        actor_device_id: str | None,
+        reason_code: str | None = None,
+        attempt_id: str | None = None,
+    ) -> None:
+        event = ApprovalAuditEvent(
+            request_id=request.request_id,
+            task_id=request.task_id,
+            step_id=request.step_id,
+            event_type=event_type,
+            occurred_at=datetime.fromisoformat(self._now()),
+            actor_device_id=actor_device_id,
+            owner_credential_generation=request.owner_credential_generation,
+            action_digest=request.action_digest,
+            tool_definition_digest=request.tool_definition_digest,
+            attempt_id=attempt_id,
+            reason_code=reason_code,
+        )
+        self._connection.execute(
+            """INSERT INTO approval_audit_events
+                (event_id, request_id, task_id, step_id, event_type, occurred_at,
+                 actor_device_id, owner_credential_generation, action_digest,
+                 tool_definition_digest, attempt_id, reason_code)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(event.event_id), str(event.request_id), event.task_id, event.step_id,
+                event.event_type.value, _timestamp(event.occurred_at), event.actor_device_id,
+                event.owner_credential_generation, event.action_digest,
+                event.tool_definition_digest, event.attempt_id, event.reason_code,
+            ),
+        )
+
+    def list_approval_audit_events(
+        self, request_id: UUID | str | None = None
+    ) -> tuple[ApprovalAuditEvent, ...]:
+        if request_id is None:
+            rows = self._connection.execute(
+                "SELECT * FROM approval_audit_events ORDER BY rowid"
+            ).fetchall()
+        else:
+            try:
+                parsed_id = request_id if isinstance(request_id, UUID) else UUID(request_id)
+            except (TypeError, ValueError, AttributeError):
+                raise EntityNotFoundError("Approval request was not found.") from None
+            rows = self._connection.execute(
+                """SELECT * FROM approval_audit_events WHERE request_id = ?
+                    ORDER BY rowid""",
+                (str(parsed_id),),
+            ).fetchall()
+        try:
+            return tuple(self._approval_event_from_row(row) for row in rows)
+        except (ValidationError, TypeError, ValueError):
+            raise TaskStoreError("Stored approval audit event is invalid.") from None
+
     def get_goal(self, goal_id: str) -> Goal:
         row = self._connection.execute("SELECT * FROM goals WHERE id = ?", (goal_id,)).fetchone()
         if row is None:
@@ -698,6 +1463,10 @@ class TaskStore:
             if row is None:
                 raise EntityNotFoundError("Task was not found.")
             current = TaskState(row["state"])
+            if current is TaskState.WAITING_APPROVAL or target is TaskState.WAITING_APPROVAL:
+                raise InvalidTransitionError(
+                    "Approval waiting transitions require an atomic approval operation."
+                )
             validate_task_transition(current, target)
             self._connection.execute(
                 "UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?",
@@ -719,6 +1488,13 @@ class TaskStore:
             current = StepState(row["state"])
             if current is StepState.RUNNING or target is StepState.RUNNING:
                 raise InvalidTransitionError("Running transitions require an attempt operation.")
+            if (
+                current is StepState.WAITING_APPROVAL
+                or target is StepState.WAITING_APPROVAL
+            ):
+                raise InvalidTransitionError(
+                    "Approval waiting transitions require an atomic approval operation."
+                )
             if current is StepState.RECONCILIATION_REQUIRED:
                 raise InvalidTransitionError("Reconciliation requires an explicit outcome.")
             validate_step_transition(current, target)
@@ -896,7 +1672,11 @@ class TaskStore:
                 """SELECT step_attempts.id, step_attempts.attempt_number,
                     attempt_authorizations.action_digest,
                     attempt_authorizations.device_id,
-                    attempt_authorizations.authorization_fingerprint
+                    attempt_authorizations.authorization_fingerprint,
+                    EXISTS(SELECT 1 FROM approval_audit_events
+                        WHERE approval_audit_events.attempt_id = step_attempts.id
+                            AND approval_audit_events.event_type = 'consumed')
+                        AS approval_consumed
                     FROM step_attempts LEFT JOIN attempt_authorizations
                         ON attempt_authorizations.attempt_id = step_attempts.id
                     WHERE step_attempts.step_id = ? AND step_attempts.outcome = 'running'""",
@@ -912,7 +1692,9 @@ class TaskStore:
                 safe_replay = step.replay_safety is ReplaySafety.PURE or (
                     step.replay_safety is ReplaySafety.IDEMPOTENT and allow_safe_replay
                 )
-                if safe_replay and step.attempt_count < step.attempt_limit:
+                if active["approval_consumed"]:
+                    target = StepState.RECONCILIATION_REQUIRED
+                elif safe_replay and step.attempt_count < step.attempt_limit:
                     target = StepState.RETRY_WAIT
                 elif step.replay_safety is ReplaySafety.PURE:
                     target = StepState.FAILED
@@ -1093,7 +1875,11 @@ class TaskStore:
                 """SELECT step_attempts.id, step_attempts.attempt_number,
                     attempt_authorizations.action_digest,
                     attempt_authorizations.device_id,
-                    attempt_authorizations.authorization_fingerprint
+                    attempt_authorizations.authorization_fingerprint,
+                    EXISTS(SELECT 1 FROM approval_audit_events
+                        WHERE approval_audit_events.attempt_id = step_attempts.id
+                            AND approval_audit_events.event_type = 'consumed')
+                        AS approval_consumed
                     FROM step_attempts LEFT JOIN attempt_authorizations
                         ON attempt_authorizations.attempt_id = step_attempts.id
                     WHERE step_attempts.step_id = ? AND step_attempts.outcome = 'running'""",
@@ -1102,7 +1888,9 @@ class TaskStore:
             if active is None:
                 raise ActiveAttemptError("Step has no persisted running attempt.")
 
-            if step.replay_safety is ReplaySafety.PURE:
+            if active["approval_consumed"]:
+                target = StepState.RECONCILIATION_REQUIRED
+            elif step.replay_safety is ReplaySafety.PURE:
                 target = (
                     StepState.RETRY_WAIT
                     if step.attempt_count < step.attempt_limit

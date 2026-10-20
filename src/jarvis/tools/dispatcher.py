@@ -27,6 +27,7 @@ from jarvis.tools.errors import (
     ToolTimeoutError,
 )
 from jarvis.tools.models import (
+    ApprovedTaskActionPermit,
     AuthorizationContext,
     ToolAuditEvent,
     ToolAuditOutcome,
@@ -98,6 +99,7 @@ class ToolDispatcher:
         *,
         authorization_context: AuthorizationContext | None = None,
         correlation: ToolExecutionCorrelation | None = None,
+        approval_permit: ApprovedTaskActionPermit | None = None,
     ) -> ToolExecutionResult:
         definition = self._registry.get(request.tool_name)
         decision = self._policy.authorize(definition, authorization_context)
@@ -131,7 +133,18 @@ class ToolDispatcher:
             raise
 
         if definition.requires_approval:
-            self._request_approval(definition, authorization_context, correlation)
+            if approval_permit is None:
+                self._request_approval(definition, authorization_context, correlation)
+            else:
+                if (
+                    correlation is None
+                    or approval_permit.task_id != correlation.task_id
+                    or approval_permit.step_id != correlation.step_id
+                    or approval_permit.action_digest != correlation.action_digest
+                    or approval_permit.tool_name != definition.name
+                    or approval_permit.tool_definition_digest != definition.definition_digest()
+                ):
+                    raise AuthorizationDeniedError()
 
         executor = self._executors.get(definition.name)
         if executor is None:
@@ -241,6 +254,41 @@ class ToolDispatcher:
             principal_id=authorization_context.principal_id,
             output=output,
         )
+
+    def inspect_authorized_request(
+        self,
+        request: ToolRequest,
+        authorization_context: AuthorizationContext,
+    ) -> ToolDefinition:
+        """Revalidate the trusted definition, dispatcher policy, and exact input."""
+        definition = self._registry.get(request.tool_name)
+        decision = self._policy.authorize(definition, authorization_context)
+        if not decision.allowed:
+            self._record_denial(
+                definition, authorization_context, decision.reason, correlation=None
+            )
+            raise AuthorizationDeniedError()
+        self._record(
+            self._event(
+                definition,
+                authorization_context,
+                ToolAuditOutcome.AUTHORIZATION_GRANTED,
+                "granted",
+            )
+        )
+        try:
+            self._validate_input(definition, request.arguments)
+        except ToolInputValidationError:
+            self._record(
+                self._event(
+                    definition,
+                    authorization_context,
+                    ToolAuditOutcome.VALIDATION_FAILED,
+                    "input_validation_failed",
+                )
+            )
+            raise
+        return definition
 
     def _request_approval(
         self,

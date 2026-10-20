@@ -11,6 +11,9 @@ import pytest
 from pydantic import ValidationError
 
 from jarvis.tasks import (
+    ApprovalAuditEventType,
+    ApprovalRequestRecord,
+    ApprovalStatus,
     AttemptOutcome,
     DependencyNotSatisfiedError,
     EntityNotFoundError,
@@ -29,6 +32,10 @@ from jarvis.tasks import (
     TaskState,
     TaskStoreError,
 )
+from jarvis.tasks.action import AuthorizedTaskAction
+from jarvis.tasks.authorization import TaskOwnership, TaskSubmissionProposal
+from jarvis.tasks.models import AttemptAuthorization, TaskPlan
+from jarvis.tasks.state import validate_approval_transition
 from jarvis.tasks.store import TaskStore
 
 
@@ -57,16 +64,65 @@ def seed_task(
     return goal, task, step
 
 
+def seed_owned_action(store: TaskStore, suffix: str) -> tuple[Goal, Task, Step, str]:
+    device_id = "a" * 32
+    idempotency_key = f"approval-key-{suffix}"
+    action = AuthorizedTaskAction(tool_name="jarvis.status", arguments={})
+    goal = Goal(id=f"approval-goal-{suffix}", title="Approval migration")
+    task = Task(id=f"approval-task-{suffix}", goal_id=goal.id, title="Approval task")
+    step = Step(id=f"approval-step-{suffix}", task_id=task.id, title="Status", action=action)
+    proposal = TaskSubmissionProposal(
+        idempotency_key=idempotency_key,
+        title=goal.title,
+        description=goal.description,
+        action=action,
+    )
+    ownership = TaskOwnership(
+        device_id=device_id,
+        idempotency_key=idempotency_key,
+        request_digest=proposal.request_digest(),
+    )
+    store.add_device_task_submission(
+        goal=goal,
+        plan=TaskPlan(task=task, steps=[step]),
+        ownership=ownership,
+    )
+    return goal, task, step, device_id
+
+
+def make_approval_request(
+    task: Task,
+    step: Step,
+    requesting_device_id: str,
+    *,
+    now: datetime,
+    request_id=None,
+) -> ApprovalRequestRecord:
+    assert step.action is not None
+    return ApprovalRequestRecord(
+        request_id=request_id or uuid4(),
+        task_id=task.id,
+        step_id=step.id,
+        requesting_device_id=requesting_device_id,
+        owner_device_id="f" * 32,
+        owner_credential_generation=1,
+        action_digest=step.action.digest(),
+        tool_definition_digest="c" * 64,
+        created_at=now,
+        expires_at=now + timedelta(minutes=5),
+    )
+
+
 def test_migration_ledger_and_foreign_key_enforcement(tmp_path) -> None:
     database = tmp_path / "migration.sqlite3"
     store = TaskStore(database)
 
-    assert store.schema_version == 6
+    assert store.schema_version == 7
     assert store._connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert [
         row["version"]
         for row in store._connection.execute("SELECT version FROM schema_migrations")
-    ] == [1, 2, 3, 4, 5, 6]
+    ] == [1, 2, 3, 4, 5, 6, 7]
 
     with pytest.raises(sqlite3.IntegrityError):
         store._connection.execute(
@@ -87,15 +143,205 @@ def test_v3_database_migrates_to_current_schema_without_implicit_owners(tmp_path
     connection.execute("DROP TABLE attempt_authorizations")
     connection.execute("ALTER TABLE step_attempts DROP COLUMN dispatch_claimed_at")
     connection.execute("ALTER TABLE steps DROP COLUMN action_json")
+    connection.execute("DROP TABLE approval_audit_events")
+    connection.execute("DROP TABLE approval_requests")
     connection.execute("DELETE FROM schema_migrations WHERE version > 3")
     connection.commit()
     connection.close()
 
     upgraded = TaskStore(database)
-    assert upgraded.schema_version == 6
+    assert upgraded.schema_version == 7
     assert upgraded.get_task(task.id).id == task.id
     assert upgraded.get_task_ownership(task.id) is None
     upgraded.close()
+
+
+def _downgrade_test_database_to_v6(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP TABLE approval_audit_events")
+    connection.execute("DROP TABLE approval_requests")
+    connection.execute("DELETE FROM schema_migrations WHERE version > 6")
+    connection.commit()
+
+
+def test_v6_migration_preserves_attempts_checkpoints_submissions_and_bindings(tmp_path) -> None:
+    database = tmp_path / "task-v6-upgrade.sqlite3"
+    fixed_now = datetime(2026, 10, 19, 8, 30, tzinfo=UTC)
+    store = TaskStore(database, clock=lambda: fixed_now)
+    goal, task, step, device_id = seed_owned_action(store, "preserve")
+    store.transition_step(step.id, StepState.READY)
+    store.start_step_attempt(
+        step.id,
+        authorization=AttemptAuthorization(
+            device_id=device_id,
+            action_digest=step.action.digest(),
+            authorization_fingerprint="b" * 64,
+        ),
+    )
+    store.finish_step_attempt(
+        step.id, AttemptOutcome.SUCCEEDED, result=StepResult(data={"ok": True})
+    )
+    attempts_before = store.list_attempts(step.id)
+    events_before = store.list_events(task_id=task.id)
+    checkpoints_before = store.list_checkpoints(task.id)
+    ownership_before = store.get_task_ownership(task.id)
+    authorization_before = tuple(
+        store._connection.execute(
+            "SELECT * FROM attempt_authorizations WHERE task_id = ?", (task.id,)
+        ).fetchone()
+    )
+    store.close()
+
+    connection = sqlite3.connect(database)
+    _downgrade_test_database_to_v6(connection)
+    connection.close()
+
+    upgraded = TaskStore(database, clock=lambda: fixed_now)
+    assert upgraded.schema_version == 7
+    assert upgraded.get_goal(goal.id).id == goal.id
+    assert upgraded.get_task(task.id).id == task.id
+    assert upgraded.get_step(step.id).state is StepState.SUCCEEDED
+    assert upgraded.list_attempts(step.id) == attempts_before
+    assert upgraded.list_events(task_id=task.id) == events_before
+    assert upgraded.list_checkpoints(task.id) == checkpoints_before
+    assert upgraded.get_task_ownership(task.id) == ownership_before
+    assert tuple(
+        upgraded._connection.execute(
+            "SELECT * FROM attempt_authorizations WHERE task_id = ?", (task.id,)
+        ).fetchone()
+    ) == authorization_before
+    assert upgraded._connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert upgraded._connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    upgraded.close()
+
+
+def test_v6_migration_failure_rolls_back_schema_and_data(tmp_path) -> None:
+    database = tmp_path / "task-v6-rollback.sqlite3"
+    store = TaskStore(database)
+    _, task, step = seed_task(store)
+    store.close()
+
+    connection = sqlite3.connect(database)
+    _downgrade_test_database_to_v6(connection)
+    connection.close()
+
+    with pytest.raises(TaskStoreError, match="clock"):
+        TaskStore(database, clock=lambda: datetime(2026, 10, 19, 8, 30))
+
+    connection = sqlite3.connect(database)
+    assert connection.execute(
+        "SELECT MAX(version) FROM schema_migrations"
+    ).fetchone()[0] == 6
+    assert connection.execute(
+        "SELECT id FROM tasks WHERE id = ?", (task.id,)
+    ).fetchone()[0] == task.id
+    assert connection.execute(
+        "SELECT id FROM steps WHERE id = ?", (step.id,)
+    ).fetchone()[0] == step.id
+    assert connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'approval_requests'"
+    ).fetchone() is None
+    assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    connection.close()
+
+
+def test_approval_contract_binds_action_and_enforces_status_and_active_uniqueness(tmp_path) -> None:
+    now = datetime(2026, 10, 19, 8, 30, tzinfo=UTC)
+    store = TaskStore(tmp_path / "approval-contract.sqlite3", clock=lambda: now)
+    _, task, step, device_id = seed_owned_action(store, "contract")
+    request = make_approval_request(task, step, device_id, now=now)
+
+    stored = store.create_approval_request(request)
+    assert stored == request
+    assert store.list_approval_requests(task.id) == (request,)
+    events = store.list_approval_audit_events(request.request_id)
+    assert [event.event_type for event in events] == [ApprovalAuditEventType.REQUESTED]
+    assert events[0].action_digest == step.action.digest()
+    assert events[0].owner_credential_generation == 1
+
+    validate_approval_transition(ApprovalStatus.PENDING, ApprovalStatus.APPROVED)
+    validate_approval_transition(ApprovalStatus.APPROVED, ApprovalStatus.CONSUMED)
+    with pytest.raises(InvalidTransitionError):
+        validate_approval_transition(ApprovalStatus.APPROVED, ApprovalStatus.DENIED)
+    with pytest.raises(InvalidTransitionError):
+        validate_approval_transition(ApprovalStatus.PENDING, ApprovalStatus.CONSUMED)
+
+    # Step 1 defines the durable contract but exposes no decision operation.
+    # Exercise the schema guard directly to verify that approved requests still
+    # count as active and the SQL transition graph rejects illegal changes.
+    decided_at = now.isoformat(timespec="microseconds")
+    store._connection.execute(
+        """UPDATE approval_requests SET status = 'approved', decided_at = ?,
+            decided_by_device_id = ? WHERE request_id = ?""",
+        (decided_at, "f" * 32, str(request.request_id)),
+    )
+    approved = store.get_approval_request(request.request_id)
+    assert approved.status is ApprovalStatus.APPROVED
+    assert approved.consumed_at is None
+    with pytest.raises(sqlite3.IntegrityError):
+        store._connection.execute(
+            """INSERT INTO approval_requests
+                (request_id, task_id, step_id, requesting_device_id, owner_device_id,
+                 owner_credential_generation, action_digest, tool_definition_digest,
+                 status, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+            (
+                str(uuid4()), request.task_id, request.step_id,
+                request.requesting_device_id, request.owner_device_id,
+                request.owner_credential_generation, request.action_digest,
+                request.tool_definition_digest, now.isoformat(),
+                (now + timedelta(minutes=5)).isoformat(),
+            ),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="invalid approval status transition"):
+        store._connection.execute(
+            "UPDATE approval_requests SET status = 'denied' WHERE request_id = ?",
+            (str(request.request_id),),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        store._connection.execute("DELETE FROM approval_audit_events")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        store._connection.execute(
+            "UPDATE approval_audit_events SET reason_code = 'tampered'"
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="binding is immutable"):
+        store._connection.execute(
+            "UPDATE approval_requests SET action_digest = ? WHERE request_id = ?",
+            ("d" * 64, str(request.request_id)),
+        )
+    store.close()
+
+
+def test_approval_audit_failure_rolls_back_request_and_waiting_state_is_reserved(tmp_path) -> None:
+    now = datetime(2026, 10, 19, 8, 30, tzinfo=UTC)
+    store = TaskStore(tmp_path / "approval-audit-rollback.sqlite3", clock=lambda: now)
+    _, task, step, device_id = seed_owned_action(store, "audit")
+    store._connection.execute(
+        """CREATE TRIGGER fail_approval_request_audit
+            BEFORE INSERT ON approval_audit_events WHEN NEW.event_type = 'requested'
+            BEGIN SELECT RAISE(ABORT, 'injected approval audit failure'); END"""
+    )
+    request = make_approval_request(task, step, device_id, now=now)
+    with pytest.raises(sqlite3.IntegrityError, match="injected approval audit failure"):
+        store.create_approval_request(request)
+    with pytest.raises(EntityNotFoundError):
+        store.get_approval_request(request.request_id)
+    assert store.list_approval_audit_events() == ()
+
+    plain_goal, plain_task, plain_step = seed_task(store, step_id="reserved-step")
+    with pytest.raises(InvalidTransitionError):
+        store.transition_task(plain_task.id, TaskState.WAITING_APPROVAL)
+    with pytest.raises(InvalidTransitionError):
+        store.transition_step(plain_step.id, StepState.WAITING_APPROVAL)
+    store._connection.execute(
+        "UPDATE tasks SET state = 'waiting_approval' WHERE id = ?", (plain_task.id,)
+    )
+    store._connection.execute(
+        "UPDATE steps SET state = 'waiting_approval' WHERE id = ?", (plain_step.id,)
+    )
+    assert store.get_task(plain_task.id).state is TaskState.WAITING_APPROVAL
+    assert store.get_step(plain_step.id).state is StepState.WAITING_APPROVAL
+    assert store.get_goal(plain_goal.id).id == plain_goal.id
+    store.close()
 
 
 def test_database_persists_goal_plan_attempt_event_and_checkpoint_after_reopen(tmp_path) -> None:

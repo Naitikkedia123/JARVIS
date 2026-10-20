@@ -50,8 +50,6 @@ class DeviceTaskToolPolicy(ToolPolicy):
 
         if registered is not definition:
             return AuthorizationDecision(allowed=False, reason="unregistered_tool")
-        if definition.requires_approval:
-            return AuthorizationDecision(allowed=False, reason="approval_required")
         if definition.name != _STATUS_TOOL_NAME:
             return AuthorizationDecision(allowed=False, reason="tool_not_allowlisted")
         if (

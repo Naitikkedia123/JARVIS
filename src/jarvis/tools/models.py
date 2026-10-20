@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated
@@ -56,6 +58,7 @@ class ToolDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     name: ToolName
+    version: str = Field(default="1", min_length=1, max_length=32, pattern=r"^[A-Za-z0-9._+-]+$")
     description: str = Field(min_length=1, max_length=500)
     input_schema: type[BaseModel]
     output_schema: type[BaseModel]
@@ -75,6 +78,44 @@ class ToolDefinition(BaseModel):
         if self.requires_approval and self.approval_summary is None:
             raise ValueError("Approval-required tools must declare a safe approval summary.")
         return self
+
+    def definition_digest(self) -> str:
+        """Hash the trusted, execution-relevant tool contract and explicit version."""
+        canonical = json.dumps(
+            {
+                "version": self.version,
+                "name": self.name,
+                "description": self.description,
+                "input_schema": self.input_schema.model_json_schema(),
+                "output_schema": self.output_schema.model_json_schema(),
+                "required_capabilities": sorted(self.required_capabilities),
+                "access": self.access.value,
+                "timeout_seconds": self.timeout_seconds,
+                "max_result_bytes": self.max_result_bytes,
+                "requires_approval": self.requires_approval,
+                "approval_summary": self.approval_summary,
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(
+            b"jarvis:tool-definition:v1\0" + canonical.encode("utf-8")
+        ).hexdigest()
+
+
+class ApprovedTaskActionPermit(BaseModel):
+    """Ephemeral exact-action permit minted only after durable approval consumption."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    request_id: str = Field(min_length=36, max_length=36)
+    task_id: str = Field(min_length=1, max_length=128)
+    step_id: str = Field(min_length=1, max_length=128)
+    tool_name: ToolName
+    action_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    tool_definition_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class ToolRequest(BaseModel):

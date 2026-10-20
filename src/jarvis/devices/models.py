@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import (
     BaseModel,
@@ -79,6 +79,7 @@ class Device(DeviceModel):
     paired_at: datetime
     last_seen_at: datetime
     revoked_at: datetime | None = None
+    credential_generation: int = Field(default=0, ge=0, strict=True)
 
     @field_validator("name", mode="before")
     @classmethod
@@ -112,3 +113,37 @@ class PairingReceipt(DeviceModel):
 
     device: Device
     access_token: SecretStr
+
+
+class OwnerCredentialReceipt(DeviceModel):
+    """One-time owner credential replacement and its finite expiry."""
+
+    device: Device
+    access_token: SecretStr
+    expires_at: datetime
+
+    @field_validator("expires_at")
+    @classmethod
+    def expiry_is_aware_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Owner credential expiry must include a timezone.")
+        return value.astimezone(UTC)
+
+
+class DeviceCredentialAuditEvent(DeviceModel):
+    """Credential lifecycle event without bearer tokens or credential digests."""
+
+    event_id: Annotated[str, StringConstraints(strict=True, min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$")]
+    occurred_at: datetime
+    event_type: Literal["owner_credential_rotated", "owner_credential_recovered"]
+    device_id: DeviceId
+    actor: Literal["authenticated_owner", "host_local_operator"]
+    origin: Literal["owner_rotation_api", "host_local_recovery_cli"]
+    outcome: Literal["success"]
+
+    @field_validator("occurred_at")
+    @classmethod
+    def timestamp_is_aware_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Credential audit timestamp must include a timezone.")
+        return value.astimezone(UTC)

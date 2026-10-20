@@ -24,6 +24,7 @@ from jarvis.devices.store import (
     DevicePairingUnavailableError,
     DeviceStore,
     DeviceStoreError,
+    OwnerCredentialRateLimitError,
 )
 from jarvis.logging import configure_logging
 from jarvis.policy.allowlist import DeviceTaskToolPolicy
@@ -90,6 +91,7 @@ def _build_task_application_services(
         DeterministicPlanner(),
         runner=None,
         authorized_runner=runner,
+        approval_lifetime_minutes=settings.approval_lifetime_minutes,
     )
     return _TaskApplicationServices(
         store=store,
@@ -153,7 +155,12 @@ def create_app(
                 or database_path.is_file()
             ):
                 database_path.parent.mkdir(parents=True, exist_ok=True)
-                device_store = DeviceStore(database_path)
+                device_store = DeviceStore(
+                    database_path,
+                    owner_credential_lifetime_days=(
+                        resolved_settings.owner_credential_lifetime_days
+                    ),
+                )
                 resources.callback(device_store.close)
                 service = DeviceService(
                     device_store,
@@ -244,6 +251,18 @@ def create_app(
         del request, exc
         return _error_response(
             503, "device_store_unavailable", "The device service is temporarily unavailable."
+        )
+
+    @application.exception_handler(OwnerCredentialRateLimitError)
+    async def owner_credential_rate_limit(
+        request: Request, exc: OwnerCredentialRateLimitError
+    ) -> JSONResponse:
+        del request
+        return _error_response(
+            429,
+            "owner_credential_rate_limited",
+            "Owner credential rotation is temporarily rate limited.",
+            headers={"Retry-After": str(exc.retry_after_seconds)},
         )
 
     @application.exception_handler(TaskAuthorizationError)
