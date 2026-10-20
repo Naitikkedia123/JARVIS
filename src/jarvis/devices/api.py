@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -11,14 +11,18 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from jarvis.config import Settings
 from jarvis.devices.models import (
+    DEFAULT_DEVICE_PRESENCE_FRESHNESS_SECONDS,
     CapabilityName,
     CapabilityReport,
     Device,
     DeviceId,
     DevicePlatform,
+    DevicePresence,
     DeviceRole,
     PairingMetadata,
+    classify_device_presence,
 )
 from jarvis.devices.service import DeviceAuthenticationError, DeviceService
 
@@ -104,10 +108,20 @@ class DeviceResponse(_ApiModel):
     reported_capabilities: frozenset[CapabilityName]
     paired_at: datetime
     last_seen_at: datetime
+    presence: DevicePresence
     revoked_at: datetime | None
 
     @classmethod
-    def from_device(cls, device: Device) -> DeviceResponse:
+    def from_device(
+        cls,
+        device: Device,
+        *,
+        now: datetime | None = None,
+        freshness_window: timedelta = timedelta(
+            seconds=DEFAULT_DEVICE_PRESENCE_FRESHNESS_SECONDS
+        ),
+    ) -> DeviceResponse:
+        current = now if now is not None else datetime.now(UTC)
         return cls(
             id=device.id,
             name=device.name,
@@ -116,8 +130,22 @@ class DeviceResponse(_ApiModel):
             reported_capabilities=device.reported_capabilities,
             paired_at=device.paired_at,
             last_seen_at=device.last_seen_at,
+            presence=classify_device_presence(
+                device.last_seen_at,
+                now=current,
+                freshness_window=freshness_window,
+            ),
             revoked_at=device.revoked_at,
         )
+
+
+def _device_response(request: Request, device: Device) -> DeviceResponse:
+    settings: Settings = request.app.state.settings
+    return DeviceResponse.from_device(
+        device,
+        now=datetime.now(UTC),
+        freshness_window=timedelta(seconds=settings.device_presence_freshness_seconds),
+    )
 
 
 class PairingResponse(_ApiModel):
@@ -162,6 +190,7 @@ async def pair_device(
     payload: PairDeviceRequest,
     service: Annotated[DeviceService, Depends(device_service)],
     response: Response,
+    request: Request,
 ) -> PairingResponse:
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
@@ -172,7 +201,7 @@ async def pair_device(
         reported_capabilities=payload.reported_capabilities,
     )
     return PairingResponse(
-        device=DeviceResponse.from_device(receipt.device),
+        device=_device_response(request, receipt.device),
         access_token=receipt.access_token.get_secret_value(),
     )
 
@@ -180,8 +209,9 @@ async def pair_device(
 @router.get("/me", response_model=DeviceResponse)
 async def get_current_device(
     authenticated: Annotated[tuple[SecretStr, Device], Depends(authenticated_device)],
+    request: Request,
 ) -> DeviceResponse:
-    return DeviceResponse.from_device(authenticated[1])
+    return _device_response(request, authenticated[1])
 
 
 @router.patch("/me/capabilities", response_model=DeviceResponse)
@@ -189,9 +219,10 @@ async def update_capabilities(
     payload: CapabilityReport,
     authenticated: Annotated[tuple[SecretStr, Device], Depends(authenticated_device)],
     service: Annotated[DeviceService, Depends(device_service)],
+    request: Request,
 ) -> DeviceResponse:
     device = service.update_reported_capabilities(authenticated[0], payload.reported_capabilities)
-    return DeviceResponse.from_device(device)
+    return _device_response(request, device)
 
 
 @router.post("/pairing-codes", response_model=PairingCodeResponse, status_code=201)
@@ -215,12 +246,13 @@ async def rotate_owner_credential(
     authenticated: Annotated[tuple[SecretStr, Device], Depends(authenticated_device)],
     service: Annotated[DeviceService, Depends(device_service)],
     response: Response,
+    request: Request,
 ) -> OwnerCredentialRotationResponse:
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     receipt = service.rotate_owner_credential(authenticated[0])
     return OwnerCredentialRotationResponse(
-        device=DeviceResponse.from_device(receipt.device),
+        device=_device_response(request, receipt.device),
         access_token=receipt.access_token.get_secret_value(),
         expires_at=receipt.expires_at,
     )
@@ -230,9 +262,12 @@ async def rotate_owner_credential(
 async def list_devices(
     authenticated: Annotated[tuple[SecretStr, Device], Depends(authenticated_device)],
     service: Annotated[DeviceService, Depends(device_service)],
+    request: Request,
 ) -> DeviceListResponse:
     devices = service.list_devices(authenticated[0])
-    return DeviceListResponse(devices=tuple(DeviceResponse.from_device(device) for device in devices))
+    return DeviceListResponse(
+        devices=tuple(_device_response(request, device) for device in devices)
+    )
 
 
 @router.delete("/{device_id}", response_model=DeviceResponse)
@@ -240,6 +275,7 @@ async def revoke_device(
     device_id: DeviceId,
     authenticated: Annotated[tuple[SecretStr, Device], Depends(authenticated_device)],
     service: Annotated[DeviceService, Depends(device_service)],
+    request: Request,
 ) -> DeviceResponse:
     device = service.revoke_device(authenticated[0], device_id)
-    return DeviceResponse.from_device(device)
+    return _device_response(request, device)
