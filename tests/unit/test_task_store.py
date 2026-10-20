@@ -353,8 +353,15 @@ def test_default_task_database_setting_uses_isolated_test_path(tmp_path) -> None
 
     configured_path = Path(os.path.abspath(os.environ["JARVIS_TASK_DATABASE_PATH"]))
     temporary_root = Path(os.path.abspath(os.environ["TEMP"]))
+    repository_root = Path(os.path.abspath(Path.cwd()))
     production_default = Path(os.path.abspath(Path.cwd() / "data/local/tasks.sqlite3"))
 
+    assert os.environ["TMP"] == os.environ["TEMP"]
+    assert temporary_root.is_absolute()
+    assert temporary_root.is_dir()
+    assert not temporary_root.is_relative_to(repository_root)
     assert configured_path != production_default
     assert configured_path.is_relative_to(temporary_root)
+    assert configured_path.name.startswith("jarvis-pytest-tasks-")
+    assert configured_path.suffix == ".sqlite3"
     assert Path(os.path.abspath(Settings().task_database_path)) == configured_path
