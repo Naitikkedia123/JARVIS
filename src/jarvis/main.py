@@ -27,6 +27,7 @@ from jarvis.devices.store import (
     OwnerCredentialRateLimitError,
 )
 from jarvis.logging import configure_logging
+from jarvis.network_binding import InterfaceProvider, resolve_listener_host
 from jarvis.policy.allowlist import DeviceTaskToolPolicy
 from jarvis.policy.device_grants import LocalDeviceTaskGrantPolicy
 from jarvis.policy.task_submission import LocalTaskSubmissionPolicy
@@ -135,12 +136,23 @@ def create_app(
     app_settings: Settings | None = None,
     *,
     device_service: DeviceService | None = None,
+    interface_provider: InterfaceProvider | None = None,
 ) -> FastAPI:
-    """Create the loopback API and manage local device and task lifecycles."""
+    """Create the API after validating its explicitly selected listener address."""
     resolved_settings = app_settings or Settings()
+    listener_host = resolve_listener_host(
+        resolved_settings,
+        interface_provider=interface_provider,
+    )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        current_listener_host = resolve_listener_host(
+            resolved_settings,
+            interface_provider=interface_provider,
+        )
+        if current_listener_host != listener_host:
+            raise RuntimeError("Configured listener address changed during startup.")
         service = device_service
         device_store: DeviceStore | None = None
         resources = ExitStack()
@@ -190,6 +202,7 @@ def create_app(
         lifespan=lifespan,
     )
     application.state.settings = resolved_settings
+    application.state.listener_host = listener_host
     application.add_middleware(DeviceRequestSizeLimitMiddleware)
     application.add_middleware(TaskRequestSafetyMiddleware)
     application.include_router(device_router)
