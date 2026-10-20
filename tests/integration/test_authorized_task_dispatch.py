@@ -22,7 +22,9 @@ from jarvis.tasks.planner import DeterministicPlanner
 from jarvis.tasks.runner import DispatcherBackedTaskRunner
 from jarvis.tasks.runtime import TaskRuntime
 from jarvis.tasks.store import TaskStore
+from jarvis.tools.approval import ApprovalRequest
 from jarvis.tools.dispatcher import InMemoryToolAuditSink, ToolDispatcher
+from jarvis.tools.errors import ToolApprovalRequiredError
 from jarvis.tools.models import ToolAuditOutcome
 from jarvis.tools.registry import ToolRegistry
 from jarvis.tools.status import StatusOutput, register_status_tool
@@ -169,6 +171,41 @@ def test_dispatch_policy_rejects_unsupported_actions_before_execution(tmp_path) 
                 action,
                 runtime.authorized_runner.policy,
             )
+        assert executor.calls == 0
+    finally:
+        store.close()
+        device_store.close()
+
+
+def test_approval_required_is_recorded_as_known_pre_execution_failure(tmp_path) -> None:
+    device_store, store, runtime, paired, submission, executor, _audit = build_runtime(
+        tmp_path,
+        dispatch_ids=["a" * 32],
+    )
+
+    async def require_approval(*args, **kwargs):
+        del args, kwargs
+        raise ToolApprovalRequiredError(
+            ApprovalRequest(
+                tool_name="jarvis.status",
+                requesting_principal=paired.device.id,
+                summary="Read local status.",
+            )
+        )
+
+    runtime.authorized_runner.execute_claimed = require_approval
+    try:
+        failed = asyncio.run(
+            runtime.run_authorized_task_async(
+                submission.plan.task.id,
+                paired.access_token,
+            )
+        )
+
+        attempt = store.list_attempts(submission.plan.steps[0].id)[0]
+        assert failed.state is TaskState.FAILED
+        assert attempt.outcome.value == "permanent_failure"
+        assert attempt.error_code.value == "permanent"
         assert executor.calls == 0
     finally:
         store.close()

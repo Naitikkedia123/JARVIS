@@ -104,9 +104,12 @@ endpoints were added.
 4. **No safe approval lifecycle:** approval requests are volatile in-memory
    pending records. The service has no trusted decision operation, expiry or
    single-use consumption; the task store has no approval-waiting state or
-   atomic approval/task linkage. A dispatcher approval exception currently
-   follows the generic uncertain-outcome path. A client-provided “approved”
-   claim or retry cannot safely resume the task.
+   atomic approval/task linkage. The async task runtime now treats
+   `ToolApprovalRequiredError` as a known permanent pre-execution failure,
+   because the dispatcher raises it before executor invocation. This avoids
+   recording an uncertain external outcome, but it does not create a resumable
+   task. A client-provided “approved” claim or retry cannot safely resume the
+   task.
 
 The existing foundations continue to reject missing/denied/mismatched policy
 contexts, reject legacy lifecycle calls for owned tasks, preserve owner-scoped
@@ -222,3 +225,22 @@ submission policy's decision/revision is not persisted as task provenance, and
 local policy changes have no durable audit or rollback history. No public task execution route,
 approval wait/resume lifecycle, grant-management route, or background worker
 was added; Pass C execution remains gated.
+
+## Pass D scoped runtime correction (2026-10-20)
+
+The authorized async runtime classifies `ToolApprovalRequiredError` as a known
+permanent failure rather than an uncertain external outcome. The dispatcher
+raises this error before invoking a tool executor, and a regression test
+asserts the executor remains untouched and the attempt receives the safe
+permanent error code. This does not implement durable approval records,
+decisions, waiting states, or resumption.
+
+The current application still registers only empty-argument `jarvis.status`
+for task dispatch, has no public execution or approval-management route, and
+does not atomically link approval data to task attempts. Owner devices use
+server-issued bearer credentials and a server-controlled role, but adding a
+management endpoint alone would not provide a safe task-resume boundary. A
+later milestone must design and test the durable request, explicit owner
+decision, task/attempt linkage, current-policy revalidation, single-use
+consumption, crash handling, and authenticated execution path together. Until
+then, approval-required task execution remains unavailable and default-deny.
