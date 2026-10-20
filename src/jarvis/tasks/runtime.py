@@ -49,6 +49,7 @@ from jarvis.tasks.runner import DispatcherBackedTaskRunner
 from jarvis.tasks.store import TaskStore
 from jarvis.tools.errors import (
     AuthorizationDeniedError,
+    ToolApprovalRequiredError,
     ToolAuditError,
     ToolExecutionError,
     ToolInputValidationError,
@@ -347,6 +348,7 @@ class TaskRuntime:
                 result = await runner.execute_claimed(task_id, step, access_token, binding)
             except (
                 AuthorizationDeniedError,
+                ToolApprovalRequiredError,
                 ToolInputValidationError,
                 TaskAuthorizationError,
             ):
