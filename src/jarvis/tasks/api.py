@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -30,6 +30,8 @@ from jarvis.tasks.models import (
     Step,
     StepAttempt,
     StepState,
+    TaskEvent,
+    TaskEventType,
     TaskPlan,
     TaskState,
 )
@@ -42,6 +44,9 @@ _STATUS_ACTION = "jarvis.status"
 MAX_TASK_REQUEST_BYTES = 16 * 1024
 MAX_TASK_JSON_DEPTH = 32
 MAX_TASK_JSON_NODES = 2048
+MAX_TASK_EVENT_CURSOR = 9_223_372_036_854_775_807
+DEFAULT_TASK_EVENT_PAGE_SIZE = 50
+MAX_TASK_EVENT_PAGE_SIZE = 100
 
 
 class TaskSubmissionRequest(TaskSubmissionProposal):
@@ -245,6 +250,45 @@ class TaskStatusResponse(BaseModel):
     steps: tuple[TaskStepStatusResponse, ...]
 
 
+class TaskEventResponse(BaseModel):
+    """Allowlisted event facts exposed to the owning task device."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: int
+    event_type: TaskEventType
+    task_id: str
+    step_id: str | None = None
+    from_state: str | None = None
+    to_state: str | None = None
+    occurred_at: datetime
+
+    @classmethod
+    def from_event(cls, event: TaskEvent) -> TaskEventResponse:
+        # Goal IDs and the internal metadata object are deliberately not public.
+        if event.task_id is None:
+            raise TaskStoreError("Stored task event has no task binding.")
+        return cls(
+            id=event.id,
+            event_type=event.event_type,
+            task_id=event.task_id,
+            step_id=event.step_id,
+            from_state=event.from_state,
+            to_state=event.to_state,
+            occurred_at=event.occurred_at,
+        )
+
+
+class TaskEventPageResponse(BaseModel):
+    """A bounded page; repeat the same exclusive cursor to replay a page."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    events: tuple[TaskEventResponse, ...]
+    next_cursor: int
+    has_more: bool
+
+
 class ApprovalDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -403,6 +447,49 @@ async def get_task_status(
         return _project_task_status(plan, store)
     except (TaskStoreError, sqlite3.Error, TypeError, ValueError):
         raise HTTPException(status_code=503, detail="Task status is unavailable.") from None
+
+
+@router.get("/{task_id}/events", response_model=TaskEventPageResponse)
+async def get_task_events(
+    task_id: str,
+    authenticated: Annotated[tuple[SecretStr, Device], Depends(authenticated_device)],
+    store: Annotated[TaskStore, Depends(_task_store)],
+    response: Response,
+    after: int = Query(default=0, ge=0, le=MAX_TASK_EVENT_CURSOR),
+    limit: int = Query(default=DEFAULT_TASK_EVENT_PAGE_SIZE, ge=1, le=MAX_TASK_EVENT_PAGE_SIZE),
+) -> TaskEventPageResponse:
+    """Poll allowlisted task events using an exclusive persisted-ID cursor."""
+    device = authenticated[1]
+    try:
+        # Resolve ownership before inspecting the event cursor so foreign and
+        # unknown task IDs retain the existing indistinguishable 404 behavior.
+        store.get_task_plan_for_device(task_id, device.id)
+        latest_event_id = store.latest_task_event_id(task_id)
+        if after > latest_event_id or (
+            after != 0 and not store.task_event_exists(task_id, after)
+        ):
+            raise HTTPException(status_code=422, detail="Task event cursor is invalid.")
+        fetched = store.list_task_events_after(
+            task_id,
+            after_event_id=after,
+            limit=limit + 1,
+        )
+    except EntityNotFoundError:
+        raise HTTPException(status_code=404, detail="Task was not found.") from None
+    except HTTPException:
+        raise
+    except (TaskStoreError, sqlite3.Error, TypeError, ValueError):
+        raise HTTPException(status_code=503, detail="Task events are unavailable.") from None
+
+    has_more = len(fetched) > limit
+    page = fetched[:limit]
+    next_cursor = page[-1].id if page else after
+    response.headers["Cache-Control"] = "no-store"
+    return TaskEventPageResponse(
+        events=tuple(TaskEventResponse.from_event(event) for event in page),
+        next_cursor=next_cursor,
+        has_more=has_more,
+    )
 
 
 @router.post("/{task_id}/cancel", response_model=TaskStatusResponse)
