@@ -2168,6 +2168,50 @@ class TaskStore:
             for row in rows
         ]
 
+    def latest_task_event_id(self, task_id: str) -> int:
+        """Return the greatest persisted event ID for one task, or zero."""
+        row = self._connection.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        return int(row[0])
+
+    def task_event_exists(self, task_id: str, event_id: int) -> bool:
+        """Return whether a persisted event ID belongs to the requested task."""
+        row = self._connection.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND id = ? LIMIT 1",
+            (task_id, event_id),
+        ).fetchone()
+        return row is not None
+
+    def list_task_events_after(
+        self, task_id: str, *, after_event_id: int, limit: int
+    ) -> list[TaskEvent]:
+        """Read task events after an exclusive persisted-ID cursor in ID order."""
+        if after_event_id < 0 or after_event_id > 9_223_372_036_854_775_807:
+            raise ValueError("The task event cursor is outside the supported range.")
+        if limit < 1 or limit > 101:
+            raise ValueError("The task event page size is outside the supported range.")
+        rows = self._connection.execute(
+            """SELECT * FROM task_events
+                WHERE task_id = ? AND id > ? ORDER BY id LIMIT ?""",
+            (task_id, after_event_id, limit),
+        )
+        return [
+            TaskEvent(
+                id=row["id"],
+                event_type=TaskEventType(row["event_type"]),
+                goal_id=row["goal_id"],
+                task_id=row["task_id"],
+                step_id=row["step_id"],
+                from_state=row["from_state"],
+                to_state=row["to_state"],
+                occurred_at=datetime.fromisoformat(row["occurred_at"]),
+                metadata=EventMetadata.model_validate_json(row["metadata_json"]),
+            )
+            for row in rows
+        ]
+
     def list_attempts(self, step_id: str) -> list[StepAttempt]:
         rows = self._connection.execute(
             """SELECT step_attempts.*, attempt_authorizations.task_id AS binding_task_id,
