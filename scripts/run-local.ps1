@@ -21,5 +21,14 @@ if ($pythonVersion -notmatch '^Python 3\.12(?:\.|$)') {
     throw "The target uses $pythonVersion; the local server requires Python 3.12. The target was left unchanged."
 }
 
-Write-Host "Starting JARVIS with $pythonVersion on 127.0.0.1:8000..."
-& $python -m uvicorn jarvis.main:app --host 127.0.0.1 --port 8000 --reload
+$listenerHostOutput = & $python -c "from jarvis.main import app; print(app.state.listener_host)"
+if ($LASTEXITCODE -ne 0) { throw "JARVIS listener configuration validation failed; the server was not started." }
+$listenerHost = ($listenerHostOutput | Out-String).Trim()
+try {
+    [void][System.Net.IPAddress]::Parse($listenerHost)
+} catch {
+    throw "JARVIS returned an invalid listener address; the server was not started."
+}
+
+Write-Host "Starting JARVIS with $pythonVersion on ${listenerHost}:8000..."
+& $python -m uvicorn jarvis.main:app --host $listenerHost --port 8000 --reload
